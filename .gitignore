@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller output
+build/
+build_*/
+dist/
+dist_*/
+
+# Runtime output
+camera_trace.log
+_focus_calibration/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Windows "mark of the web" streams, which become real files when a folder
+# is copied from Windows into WSL
+*:Zone.Identifier

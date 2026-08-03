@@ -1,0 +1,13 @@
+PySide6>=6.5
+pyserial>=3.5
+
+# Reads the lens position out of a captured NEF. The camera confirms every
+# move directly, so this is the independent witness used to VERIFY focus
+# rather than to drive it — and it is what Calibrate measures travel with.
+exifread>=3.0
+
+# Raw PTP-over-USB to the camera. libusb-package bundles libusb-1.0.dll,
+# which Anaconda does not ship and Windows does not put on PATH. Needs the
+# camera bound to WinUSB via Zadig — see turntable/hardware/ptp.py.
+pyusb>=1.2
+libusb-package>=1.0

@@ -1,0 +1,5 @@
+# Only needed to build the .exe or regenerate the icon —
+# the app itself never imports these.
+-r requirements.txt
+pyinstaller>=6.0
+pillow>=10.0
