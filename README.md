@@ -108,9 +108,6 @@ pip install -r requirements.txt
 python turntable_app.py
 ```
 
-Or build a standalone .exe that needs no Python on the machine that runs it —
-see [Building an .exe](#building-an-exe).
-
 ---
 
 ## Using it
