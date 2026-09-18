@@ -12,6 +12,12 @@ issued, and every frame is pulled straight out of the camera's buffer, so
 nothing depends on a card being present or on a helper application staying
 alive overnight.
 
+> **If the turntable will not connect to this app**, install ComXim's own
+> TurntableX from <https://comxim.com/softwareapps-demo/>, connect to the
+> turntable with that, then close TurntableX and try `TurntableBridge.exe`
+> again. If that does not do it, close both, try again, and cross your fingers.
+> Then double-check the COM number and the port.
+
 ---
 
 ## What you need
