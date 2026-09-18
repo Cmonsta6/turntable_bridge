@@ -6,7 +6,7 @@ the coloured connection/state badge used across the header.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QVBoxLayout,
@@ -72,12 +72,42 @@ class ScalingHost(QGraphicsView):
         # panned the scene would look like the window had come loose.
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
 
+        # THE CONTENT'S FLOOR CAN MOVE WITHOUT THE VIEWPORT MOVING. The two
+        # events below cover the viewport changing size; they cannot see the
+        # content's minimum changing underneath a viewport that stayed put —
+        # which is what rotating the preview does, swapping its 750x500 floor
+        # for 500x750. Qt announces that as a LayoutRequest on the content
+        # once the change has rippled up through the nested layouts, so that
+        # is the moment to re-fit. NOT the moment the caller changes the
+        # minimum: measured on Qt 6.9, `minimumSizeHint()` read straight
+        # after `setMinimumSize` on a nested widget still answers the OLD
+        # floor, and only the queued layout pass corrects it. Watching the
+        # event instead of asking callers to remember means every future
+        # floor change is covered too.
+        content.installEventFilter(self)
+        self._rescale_queued = False
+
     def resizeEvent(self, event):                             # noqa: D102
         super().resizeEvent(event)
         self._rescale()
 
     def showEvent(self, event):                               # noqa: D102
         super().showEvent(event)
+        self._rescale()
+
+    def eventFilter(self, watched, event):                    # noqa: D102
+        if watched is self._content and event.type() == QEvent.Type.LayoutRequest:
+            # Deferred, not inline: a filter runs BEFORE the content handles
+            # the event, and it is that handling which recomputes the floor.
+            # One zero-timer at a time, so a burst of requests during a
+            # relayout costs one fit rather than one per request.
+            if not self._rescale_queued:
+                self._rescale_queued = True
+                QTimer.singleShot(0, self._rescale_after_layout)
+        return super().eventFilter(watched, event)
+
+    def _rescale_after_layout(self) -> None:
+        self._rescale_queued = False
         self._rescale()
 
     def _rescale(self) -> None:
@@ -112,6 +142,31 @@ class ScalingHost(QGraphicsView):
     def scale_factor(self) -> float:
         """Current transform scale — 1.0 whenever the window is big enough."""
         return self.transform().m11()
+
+
+class _HintWidthBox(QWidget):
+    """
+    A container that PREFERS a given width but does not insist on it.
+
+    `Card.center_header_group` wants the two ends of a header to be the same
+    width so the middle lands in the centre — but as a preference. Done with
+    `setMinimumWidth` it becomes a demand: the title end of the live-view
+    header was being held to the ~370 px its opposite end needs, which
+    pushed that card's floor past the preview's own and cost the frame width
+    it could have used. Qt hands out room up to each item's sizeHint before
+    sharing any surplus, so reporting the width as the HINT gets the same
+    centring wherever there is room for it and gives it up gracefully — the
+    wide end holds its minimum and the narrow end shrinks — where there is
+    not.
+    """
+
+    def __init__(self, preferred_width: int, parent=None):
+        super().__init__(parent)
+        self._preferred_width = preferred_width
+
+    def sizeHint(self) -> QSize:                               # noqa: D102
+        base = super().sizeHint()
+        return QSize(max(base.width(), self._preferred_width), base.height())
 
 
 class Card(QFrame):
@@ -177,11 +232,12 @@ class Card(QFrame):
         title is one short word and the right end carries the magnifier group
         and Start live view, so the middle sat visibly left of centre.
 
-        So both ends are wrapped in containers and given the SAME minimum
+        So both ends are wrapped in containers and given the SAME preferred
         width, taken from whichever of them asks for more. That number is read
         from the widgets' own sizeHint at build time rather than written down
         here, so it follows the font and the button text instead of going
-        stale the first time either changes.
+        stale the first time either changes. A PREFERENCE, not a minimum —
+        `_HintWidthBox` explains why the difference matters for the floor.
         """
         # Everything already in the header, in order, is the left group —
         # for every card that is the accent dot and the title.
@@ -191,8 +247,8 @@ class Card(QFrame):
             if item.widget() is not None:
                 left.append(item.widget())
 
-        def group(widgets, align) -> QWidget:
-            box = QWidget()
+        def group(widgets, align, preferred: int = 0) -> QWidget:
+            box = _HintWidthBox(preferred)
             lay = QHBoxLayout(box)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(7)
@@ -205,13 +261,17 @@ class Card(QFrame):
                 lay.addStretch(1)
             return box
 
-        left_box = group(left, "left")
+        # Measured once as plain groups, then rebuilt with the shared width
+        # as their preference. Two passes because a group's natural width is
+        # only known once its widgets are in it.
+        probe_l = group(left, "left")
+        probe_r = group(right, "right")
+        ends = max(probe_l.sizeHint().width(), probe_r.sizeHint().width())
+        left_box = group(left, "left", ends)
         mid_box = group(middle, "center")
-        right_box = group(right, "right")
-
-        ends = max(left_box.sizeHint().width(), right_box.sizeHint().width())
-        left_box.setMinimumWidth(ends)
-        right_box.setMinimumWidth(ends)
+        right_box = group(right, "right", ends)
+        probe_l.deleteLater()
+        probe_r.deleteLater()
 
         # Factor 1 on the ends and 0 on the middle: the ends absorb the slack
         # equally — which is now correct, because they start equal — and the

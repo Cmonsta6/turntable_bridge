@@ -48,6 +48,7 @@ from .constants import (
 from .camera import PTPCameraClient
 from .errors import (
     CameraError, RotateDoneTimeout, TurntableError, TurntablePortClosed,
+    TurntableWriteTimeout,
 )
 from .focus import (
     STEP_UNITS, anchored_drive, compute_step_angle, drive_focus,
@@ -73,6 +74,7 @@ __all__ = [
     "SESSION_COUNTER_START",
     # errors
     "CameraError", "RotateDoneTimeout", "TurntableError", "TurntablePortClosed",
+    "TurntableWriteTimeout",
     # clients
     "ComximClient", "PTPCameraClient",
     # focus

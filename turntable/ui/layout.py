@@ -5,54 +5,99 @@ Everything here builds widgets and assigns them to `self`; the behaviour
 that reads them lives in main_window.py. Splitting along that seam keeps
 either half readable on its own.
 
-ONE GRID, THREE COLUMNS, FOUR ROWS
-----------------------------------
-    col 0  (stretch 1)    col 1  (stretch 2)    col 2  (stretch 1)
+ONE GRID, THREE COLUMNS, TWO ARRANGEMENTS — THE VIEWER IS THE MIDDLE COLUMN
+----------------------------------------------------------------------------
+The preview rotation decides which. 0° and 180° are a LANDSCAPE frame, 90°
+and 270° a PORTRAIT one, and the two want different things from the window:
+a landscape frame is starved of WIDTH, a portrait frame of HEIGHT. So there
+are two placements of the same nine cards, and `_arrange` swaps between
+them whenever the rotation crosses from one family to the other — without
+rebuilding anything, so a run in progress, the live feed and every field's
+value are untouched.
+
+LANDSCAPE (0°, 180°) — the viewer gets the middle column under Set up:
+
+    col 0  (stretch 0)    col 1  (stretch 1)    col 2  (stretch 0)
     ──────────────────    ──────────────────    ──────────────────
     ◄───────────── SET UP — devices and destination ─────────────►   row 0
-    options               progress              timing               row 1
-    ◄────── LIVE VIEW — track on the image, controls under ──────►   row 2
-    event log             capture + run         TURNTABLE DIAL       row 3
+    options               ┌────────────────┐    TURNTABLE DIAL       row 1
+    progress              │   LIVE VIEW    │    (soaks up slack)
+    timing                │  track on the  │    capture
+    event log             │ image, controls│    run
+    (soaks up slack)      └────── under ───┘
 
-Two of the four rows span all three columns — `_Slot(grid, 0, 0, span=3)` for
-Set up and `_Slot(grid, 2, 0, span=3)` for Live view — so only rows 1 and 3
-actually divide, and the pairs that line up are Options/Event log,
-Progress/Capture+Run and Timing/Turntable position. Row 3's middle cell is not
-a card but a QVBoxLayout of two, added with `grid.addLayout(go, 3, 1)`.
+PORTRAIT (90°, 270°) — the viewer gets the middle column top to bottom, and
+Set up moves into the left column so the frame can have the height Set up
+was taking:
 
-Progress sits ABOVE the live view and Capture+Run below it, which is the
-opposite of the obvious arrangement and was chosen deliberately. The two
-middle panels answer different questions at different times: Capture and Run
-are what you touch before pressing Start, so they belong beside the Event log
-at the bottom where the rest of the doing happens, with Start on the very last
-row. Progress is what you read WHILE a run is going, and during a run your
-eyes are on the preview — so it goes directly above it, in the band you are
-already looking at, rather than at the bottom of a tall window.
+    col 0  (stretch 0)    col 1  (stretch 1)    col 2  (stretch 0)
+    ──────────────────    ──────────────────    ──────────────────
+    set up                ┌──────────┐          TURNTABLE DIAL       row 0
+    options               │          │          (soaks up slack)
+    progress              │ LIVE VIEW│          capture
+    timing                │          │          run
+    event log             │          │
+    (soaks up slack)      └──────────┘
 
-It is a real QGridLayout, not four rows of QHBoxLayout, and that is the whole
-reason the column edges line up all the way down. Independent rows each size
-their own split, so the seam wanders by a few pixels per row and the window
-looks subtly untidy without it being obvious why.
+In both, the side columns are a QVBoxLayout each. Left is what you SET and
+READ — Set up when it is not on top, Options, Progress, Timing, then the
+Event log growing into whatever is left. Right is what you DO — the dial,
+growing, then Capture and Run, so Start lands in the bottom-right corner
+where a hand looking for it goes first. The left column takes Set up
+rather than the right because the right is the taller stack (the dial's
+floor is 381 px): with Set up and Progress both on the left the columns
+come to 834 and 752 px, under the portrait viewer's own 847, so on a
+1080p screen nothing has to scale.
 
-WHY EVERY COLUMN STRETCHES, AND THE PREVIEW LETTERBOXES
-The obvious move is the other one. The preview aspect-fits its frame, so every
-extra pixel of width a stretching column hands it becomes a grey bar beside
-the image — widening the window makes the preview *worse*. An earlier build
-therefore pinned the live-view card to `height x 1.5` on each resize and let
-the neighbouring column take up the slack. That was RETIRED, and the map above
-is why: a card pinned to one column's width cannot also span three, and once
-it stops spanning the column edges stop lining up, which is the one thing this
-grid is for. Alignment was judged worth more than the bars. So all three
-columns stretch, 1 : 2 : 1 (`setColumnStretch` below), the card spans, and the
-frame is centred in whatever box row 2 gives it — `LiveViewPanel.paintEvent`
-does the fit, and its `sizeHint` records why there is deliberately no
-`heightForWidth` to make the box behave. The same decision is written up from
-the other side under NOTE ON THE LETTERBOX in main_window.py.
+WHY PORTRAIT MOVES SET UP AND LANDSCAPE DOES NOT. Measured on a 2560x1400
+window: a landscape frame is WIDTH-limited (the side columns' minimums
+leave it 1648 px, and it would need 1698 to be height-limited), so giving
+it Set up's ~120 px of height gains nothing. A portrait frame is
+HEIGHT-limited at 1132 px tall; with Set up out of the way it gets ~1270,
+which is a quarter more picture. The side columns have the room: a
+portrait frame is only ~850 px wide, so they get ~850 px each, and Set
+up's 609 px minimum fits with margin.
 
-HEIGHT IS THE SCARCE AXIS. Only row 2 stretches; every other row is content
-height, which is what keeps each panel's title hard against its own top edge
-(see `Card(expand=...)` — a card that neither expands nor is pinned floats its
-title down the middle of itself).
+WHY A COLUMN AND NOT A BAND. The preview was a full-width band across the
+window on the only stretching row, and on any real monitor that starves it:
+the band was ~2500 x 550 on a 2560-wide screen, a 3:2 frame in a 4.6:1 box
+uses a third of it, and a rotated 2:3 frame a seventh. Height is what a
+viewer needs and the side panels are content-height cards that do not — so
+stack them and the viewer gets the window's full height instead of what
+three rows of cards leave over. The band was kept for a long time because
+it made the column seams line up down the window; they still do, and there
+is only one seam per side now.
+
+THE SCALING RULE. Width follows height at the frame's displayed aspect, and
+the side columns take what is left. Concretely: only column 1 stretches, so
+the viewer is handed every pixel of surplus width first; on each resize and
+each rotation `_fit_viewer_width` caps the live-view card at
+`LiveViewPanel.ideal_width(height)`, and a stretched column that has hit
+its maximum makes Qt share the remainder between the other two columns
+equally (measured, not assumed — see the note in `_fit_viewer_width`). So a
+landscape frame is width-limited and takes all the width there is, a
+portrait frame is height-limited and gives back the width it cannot use,
+and neither draws bars beside itself beyond a few pixels of rounding. The
+panel's floor turns with the rotation too (`LiveViewPanel._apply_floor`),
+so a portrait frame is never downscaled just because its floor was shaped
+for a landscape one. `LiveViewPanel.sizeHint` records why the rule is a
+width-from-height cap and not a `heightForWidth`.
+
+THE SIDE COLUMNS DO NOT SHARE A MINIMUM WIDTH. An earlier build set both to
+the wider of the two natural minimums for symmetry — and never actually
+did, because a QVBoxLayout measured inside `_build_ui` answers 0 before its
+first layout pass. Re-placing the cards on rotation made the rule take
+effect for real, and it cost the landscape frame 66 px of width on a
+1080p screen (the left column's 387 held to the right's 453). The frame
+wins: each side sits at its own natural minimum, the viewer takes the
+difference, and when the width cap binds the surplus is still shared
+equally, so the window is only ever off-centre by half the difference of
+two card minimums.
+
+Only row 1 stretches; row 0 is content height. Inside each side column the
+last card is `Card(expand=True)` and takes the slack, which is what keeps
+every other panel's title hard against its own top edge (a card that
+neither expands nor is pinned floats its title down the middle of itself).
 
 THE WINDOW HAS NO MINIMUM SIZE, and grows no scrollbars. Shrinking it does two
 things in order: the layout below reflows and tightens as far as it honestly
@@ -69,7 +114,17 @@ ScalingHost now, so the widget being scaled — the one whose geometry is the
 layout's real numbers — is `content_widget`, and `_build_ui` keeps a handle on
 it for exactly that. `MainWindow._size_to_fit_panels` reads it the same way.
 The script this was measured with was a development tool and is not shipped,
-so measuring again means writing one.
+so measuring again means writing one. For the record, the minimums that
+shaped the column layout (Windows, Segoe UI, 2026-09-18): Options 376,
+Progress 324, Timing 388, Event log 161 wide on the left; Dial 415, Capture
+453, Run 322 on the right; the live-view card 821 — the focus row's 793
+(twelve buttons, the eight arrows held at the widest label's width; see
+`FocusPanel._relabel_jog_buttons`) plus margins, above the panel's own 776
+— once the header stopped demanding 949 (see `_HintWidthBox`). So the
+whole layout's floor is about 1705 x 930, which fits a 1920 x 1080 screen
+unscaled in landscape and scales by a few percent in portrait.
+`tools/render_layout.py` is the script that measures this and renders the
+window at any size to check it.
 
 BEWARE STYLESHEET min-height. A Qt stylesheet's min-height/max-height BEAT
 `setMinimumHeight`/`setFixedHeight` on the same widget, and theme.py's global
@@ -83,12 +138,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGraphicsDropShadowEffect,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton,
-    QSpinBox, QTextEdit, QVBoxLayout, QWidget,
+    QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .dial import DirectionToggle, TurntableWidget
@@ -102,26 +157,41 @@ from .theme import (
 from .widgets import Card, ScalingHost, StatusPill
 
 
-class _Slot:
+class _Keep:
     """
-    Makes one grid cell look like a layout to the `_build_*` methods.
+    Looks like a layout to the `_build_*` methods, and keeps what it is given.
 
-    They all end in `parent.addWidget(card)` and are called from several
-    places; teaching each of them about grid coordinates would mean passing
-    (layout, row, col) everywhere and remembering which calls are cells and
-    which are plain boxes. This adapter keeps them ignorant of the difference.
+    They all end in `parent.addWidget(card)` — some with a stretch factor —
+    and know nothing about where the card goes. That is the point: placement
+    is `_arrange`'s job, done after everything is built and done AGAIN each
+    time the rotation changes family, so a builder that placed its own card
+    would have to be undone. This records the card and its stretch instead.
     """
 
-    __slots__ = ("_grid", "_row", "_col", "_span")
+    __slots__ = ("card", "stretch")
 
-    def __init__(self, grid: QGridLayout, row: int, col: int, span: int = 1):
-        self._grid, self._row, self._col, self._span = grid, row, col, span
+    def __init__(self):
+        self.card, self.stretch = None, 0
 
-    def addWidget(self, widget, *_args, **_kwargs):        # noqa: N802
-        self._grid.addWidget(widget, self._row, self._col, 1, self._span)
+    def addWidget(self, widget, stretch: int = 0, *_args, **_kwargs):  # noqa: N802
+        self.card, self.stretch = widget, stretch
 
-    def addLayout(self, layout, *_args, **_kwargs):        # noqa: N802
-        self._grid.addLayout(layout, self._row, self._col, 1, self._span)
+
+#: Which card goes where, per orientation — see the module docstring's map.
+#: `top` spans all three columns; `left` and `right` are stacked in order.
+#: Cards are the names `_build_ui` registers in `self._cards`.
+ARRANGEMENTS = {
+    "landscape": dict(
+        top=["setup"],
+        left=["options", "progress", "timing", "log"],
+        right=["dial", "capture", "run"],
+    ),
+    "portrait": dict(
+        top=[],
+        left=["setup", "options", "progress", "timing", "log"],
+        right=["dial", "capture", "run"],
+    ),
+}
 
 
 class WindowLayoutMixin:
@@ -191,59 +261,114 @@ class WindowLayoutMixin:
 
         root.addLayout(self._build_header())
 
-        # ── THREE COLUMNS, FOUR ROWS, ONE GRID ───────────────────────
-        # A real QGridLayout rather than a stack of rows, so the column edges
-        # line up all the way down the window: Options over Event log in
-        # column 0, Capture over Run+Progress in column 1, Timing over
-        # Turntable position in column 2, with Set up and Live view spanning
-        # all three. Rows of independent HBoxes cannot do that — each would
-        # size its own split and the edges would wander.
+        # ── THREE COLUMNS, TWO ROWS, ONE GRID — see the module docstring ──
+        # The viewer is the middle column and the seven other panels stack
+        # beside it. A QGridLayout still, rather than one QHBoxLayout, so the
+        # Set up bar spans the three columns and their edges line up under it.
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
-        # 1 : 2 : 1. Every column STRETCHES, so extra width is shared in that
-        # ratio rather than dumped into one of them — which is what made
-        # fullscreen put a colossal Timing panel next to a starved Options.
-        # The middle column is double because it carries the two widest
-        # things: Capture's three fields per row, and Start/Pause/Stop.
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 2)
-        grid.setColumnStretch(2, 1)
-        # Only the viewer row grows vertically; everything else is content-
-        # height, which is what keeps the panel titles hard against their tops.
-        grid.setRowStretch(2, 1)
+        # 0 : 1 : 0 — ONLY THE VIEWER STRETCHES. Every surplus pixel of width
+        # goes to the preview first, and the side columns get some only once
+        # `_fit_viewer_width` has capped the card because the frame could not
+        # use any more. Stretching the sides as well would hand the frame a
+        # share of the window it can never draw.
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
         root.addLayout(grid, 1)
         self._grid = grid
 
-        # row 0 — devices and destination, one panel across the top
-        self._build_setup_card(_Slot(grid, 0, 0, span=3))
+        # BUILT ONCE, PLACED BY `_arrange`. Each builder hands its card to a
+        # `_Keep`, which records it and the stretch the builder asked for; the
+        # builders neither know nor care which column they end up in, which
+        # is what lets the arrangement change under them later.
+        self._cards = {}
+        self._card_stretch = {}
+        for name, build in (
+            ("setup", self._build_setup_card),
+            ("options", self._build_options_card),
+            ("progress", self._build_progress_card),
+            ("timing", self._build_timing_card),
+            ("log", self._build_log_card),
+            ("liveview", self._build_liveview_card),
+            ("dial", self._build_dial_card),
+            ("capture", self._build_rotation_card),
+            ("run", self._build_transport_card),
+        ):
+            keep = _Keep()
+            build(keep)
+            self._cards[name] = keep.card
+            self._card_stretch[name] = keep.stretch
+        self._arranged = None
+        self._arrange("landscape")
 
-        # row 1 — the knobs, plus the readout you watch while a run goes
-        self._build_options_card(_Slot(grid, 1, 0))
-        self._build_progress_card(_Slot(grid, 1, 1))
-        self._build_timing_card(_Slot(grid, 1, 2))
+    # ── placing the cards ────────────────────────────────────────────
+    def _arrange(self, orientation: str) -> None:
+        """
+        Put the nine cards where `ARRANGEMENTS[orientation]` says.
 
-        # row 2 — the centre, all the way across. Everything you do while
-        # judging a focus plane lives in this one panel.
-        self._build_liveview_card(_Slot(grid, 2, 0, span=3))
+        Runs at build and again whenever the rotation moves between the
+        landscape family (0°, 180°) and the portrait one (90°, 270°). It is
+        a RELAYOUT, not a rebuild: the cards are the same widgets before and
+        after, still children of the content widget, so every field keeps
+        its value, the worker thread keeps running, the live feed keeps
+        painting, and the only thing that changes is which grid cell each
+        card is measured into. Nothing is hidden or shown either — taking an
+        item out of a layout leaves the widget where it is, visible, until
+        the next layout claims it.
 
-        # row 3 — the doing. Log under Options, the dial under Timing, and in
-        # the middle the two panels you work through in order: Capture to
-        # describe the run, Run to start it. Start therefore lands on the last
-        # row of the window, which is where a hand looking for it goes first.
-        #
-        # The `_build_*` methods take anything with `addWidget`, which is what
-        # _Slot exists to provide — so a builder can be handed a grid cell or a
-        # plain QVBoxLayout without knowing the difference. That is why moving
-        # a panel between the two is a one-line change here rather than an edit
-        # inside the builder.
-        self._build_log_card(_Slot(grid, 3, 0))
-        go = QVBoxLayout()
-        go.setSpacing(8)
-        self._build_rotation_card(go)                   # "Capture"
-        self._build_transport_card(go)                  # "Run"
-        grid.addLayout(go, 3, 1)
-        self._build_dial_card(_Slot(grid, 3, 2))
+        The grid is emptied completely each time rather than patched. Nine
+        cards and two throwaway QVBoxLayouts cost nothing to re-place, and
+        "remove everything, add everything" cannot leave a card in two
+        places or none — which patching, the first time a name moved
+        columns, did.
+        """
+        if orientation == self._arranged:
+            return
+        self._arranged = orientation
+        grid = self._grid
+        plan = ARRANGEMENTS[orientation]
+        # Set up is wide across the top and stacked in a column.
+        self._arrange_setup("wide" if "setup" in plan["top"] else "stacked")
+
+        # Empty the grid. Sub-layouts are QObjects owned by the grid, so they
+        # are detached and deleted; their widgets stay put.
+        while grid.count():
+            item = grid.takeAt(0)
+            box = item.layout()
+            if box is not None:
+                while box.count():
+                    box.takeAt(0)
+                box.setParent(None)
+                box.deleteLater()
+
+        # Landscape: Set up spans the top row and the columns fill row 1.
+        # Portrait: no top row; the columns and the viewer own row 0 and the
+        # empty row 1 gets no stretch, so it collapses to nothing.
+        if plan["top"]:
+            grid.addWidget(self._cards[plan["top"][0]], 0, 0, 1, 3)
+            row = 1
+        else:
+            row = 0
+        grid.setRowStretch(row, 1)
+        grid.setRowStretch(1 - row, 0)
+
+        columns = {}
+        for col, names in ((0, plan["left"]), (2, plan["right"])):
+            box = QVBoxLayout()
+            box.setSpacing(8)
+            for name in names:
+                box.addWidget(self._cards[name], self._card_stretch[name])
+            grid.addLayout(box, row, col)
+            columns[col] = box
+        grid.addWidget(self._cards["liveview"], row, 1)
+        self._side_columns = columns
+
+    @staticmethod
+    def orientation_for(rotation: int) -> str:
+        """Which arrangement a preview rotation calls for."""
+        return "portrait" if rotation % 360 in (90, 270) else "landscape"
 
     # ── header ───────────────────────────────────────────────────────
     def _build_header(self) -> QHBoxLayout:
@@ -314,10 +439,11 @@ class WindowLayoutMixin:
         # out two pieces and keeps ownership of every control in them.
         self._build_focus_controls()
 
-        # Header, left to right: title … Calibrate · Home … Start live view.
-        # The lens-setup pair sits in the middle, well away from both the
-        # title and the button people actually reach for, because Calibrate
-        # clears A and B and should never be a near-miss for anything.
+        # Header, left to right: title … Calibrate · Home … zoom · rotate ·
+        # Start live view · Single shot. The lens pair sits in the middle, away
+        # from both the title and the button people actually reach for, because
+        # Calibrate clears A and B and should never be a near-miss for
+        # anything.
         #
         # Centred by `Card.center_header_group`, which is assembled at the end
         # of this method once the right-hand group exists — read its docstring
@@ -391,13 +517,102 @@ class WindowLayoutMixin:
         self.btn_zoom_in.clicked.connect(lambda: self._step_zoom(+1))
         self.btn_liveview.clicked.connect(self._toggle_liveview)
 
+        # ── the rotate ────────────────────────────────────────────────
+        # For a camera bolted on its side. Beside the magnifier because it is
+        # the same kind of control — it changes what you see and nothing else,
+        # touches no saved frame, and (unlike the magnifier) needs no camera at
+        # all, so it can be set before connecting.
+        #
+        # ONE BUTTON THAT CYCLES, with its own label as the readout, rather than
+        # the magnifier's two-buttons-and-a-label. Four states means three
+        # clicks back to upright at worst, and this is set once when the camera
+        # is mounted and then left alone — spending three header widgets on it
+        # would cost preview width every day to save one click a week. The label
+        # carries the angle for the same reason the magnifier has a readout at
+        # all: a rotated preview and a sideways subject look identical.
+        self.btn_rotate = QPushButton("⟳ 0°")
+        self.btn_rotate.setFixedHeight(self.HEAD_BTN_H)
+        # Wide enough for the longest label it can hold ("⟳ 270°"), fixed so
+        # cycling cannot change the button's width — the header's two ends are
+        # given matching minimum widths at build time
+        # (`Card.center_header_group`), and a button that grew mid-cycle would
+        # shunt the centred lens buttons sideways.
+        self.btn_rotate.setFixedWidth(62)
+        self.btn_rotate.setStyleSheet(
+            f"QPushButton {{ font-size: 11px; font-weight: 700;"
+            f" padding: 0px; min-height: 0px; color: {ACCENT_CYAN};"
+            f" background-color: {PANEL_BG_SOFT};"
+            f" border: 1px solid {rgba(ACCENT_CYAN, 0.45)};"
+            f" border-radius: 5px; }}"
+            f"QPushButton:hover {{ color: #ffffff;"
+            f" background-color: {rgba(ACCENT_CYAN, 0.22)};"
+            f" border-color: {ACCENT_CYAN}; }}")
+        self.btn_rotate.setToolTip(
+            "Turn the preview 90° clockwise. Click again to keep going —\n"
+            "0° → 90° → 180° → 270° → 0°.\n"
+            "\n"
+            "For a camera mounted in portrait. The body streams live view in\n"
+            "its own sensor orientation and never says which way up it is\n"
+            "bolted, so a camera on its side sends a landscape frame with the\n"
+            "subject lying down in it.\n"
+            "\n"
+            "Affects the preview ONLY. Saved photos are the camera's own bytes\n"
+            "and are not touched, re-encoded or rotated by this.\n"
+            "\n"
+            "Remembered between sessions, since the camera stays mounted.")
+        self.btn_rotate.clicked.connect(self._step_rotation)
+
+        # ── the single shot ───────────────────────────────────────────
+        # One frame, no rotation, into <base>/<subject>_singleshots. A test
+        # exposure: check the light, the framing and the focus plane you just
+        # set, without committing to a run.
+        #
+        # LAST IN THE HEADER, behind a hairline, and the only filled AMBER
+        # control in it — because it is the one button up here that fires the
+        # shutter. Everything else in this group only changes what is on
+        # screen, and a shutter release sitting flush against the zoom pair is
+        # a mis-click that costs an actuation. `_single_shot` in
+        # main_window.py owns the behaviour.
+        shot_sep = QFrame()
+        shot_sep.setObjectName("hairline")
+        shot_sep.setFixedWidth(1)
+        shot_sep.setFixedHeight(self.HEAD_BTN_H)
+
+        self.btn_single_shot = QPushButton("◉  Single shot")
+        self.btn_single_shot.setFixedHeight(self.HEAD_BTN_H)
+        self.btn_single_shot.setStyleSheet(
+            f"QPushButton {{ font-size: 10px; font-weight: 700;"
+            f" padding: 2px 10px; min-height: 0px; color: {ACCENT_AMBER};"
+            f" background-color: {rgba(ACCENT_AMBER, 0.16)};"
+            f" border: 1px solid {rgba(ACCENT_AMBER, 0.5)};"
+            f" border-radius: 5px; }}"
+            f"QPushButton:hover {{ color: #ffffff;"
+            f" background-color: {rgba(ACCENT_AMBER, 0.34)};"
+            f" border-color: {ACCENT_AMBER}; }}"
+            f"QPushButton:disabled {{ color: {TEXT_MUTED};"
+            f" background-color: {DARK_BG};"
+            f" border-color: {BORDER_SOFT}; }}")
+        self.btn_single_shot.setToolTip(
+            "Take one photo right now. The table does not turn and the focus\n"
+            "does not move — it shoots exactly what the preview is showing.\n"
+            "\n"
+            "Lands in <save folder>/<subject>_singleshots, numbered, and never\n"
+            "overwrites an earlier one. Always saved to the PC, even with\n"
+            "'Keep photos on the camera card' ticked.\n"
+            "\n"
+            "For checking the light, the framing and the focus plane before\n"
+            "committing to a run.")
+        self.btn_single_shot.clicked.connect(self._single_shot)
+
         # Left = the dot and title already in the header, middle = the lens
-        # buttons, right = the viewing controls. Done in one call at the end
-        # because the balance needs the right-hand group to exist first.
+        # buttons, right = the viewing controls plus the single shot. Done in
+        # one call at the end because the balance needs the right-hand group to
+        # exist first.
         card.center_header_group(
             centre_buttons,
             [self.btn_zoom_out, self.lbl_zoom, self.btn_zoom_in,
-             self.btn_liveview])
+             self.btn_rotate, self.btn_liveview, shot_sep,
+             self.btn_single_shot])
 
         self.liveview = LiveViewPanel()
         card.add(self.liveview)
@@ -407,12 +622,79 @@ class WindowLayoutMixin:
         # ONE row under the preview, holding every focus control. The ~50 px
         # the old second row and its hairline took come straight back here as
         # preview: `card.body` gives all its slack to index 0 (the live view)
-        # and grid row 2 is the only row that stretches, so removing fixed
+        # and the viewer row is the only row that stretches, so removing fixed
         # height below the image is the same thing as adding it to the image.
         card.add(self.focus_panel.controls_widget)
+        # The row's floor is its PREFERRED width, not the sum of its buttons'
+        # 34 px minimums. Now that the card is a column and gets capped at the
+        # frame's width, it actually reaches its floor — a portrait frame on
+        # a 1080p screen lands there — and at the buttons' bare minimum "◄ 500"
+        # renders as "◄ 50" with the rest cut off. A size policy rather than a
+        # number: `Minimum` tells every layout above that this widget's
+        # sizeHint IS its minimum, and the hint follows the labels, which is
+        # what a number read here could not do — two of the jog buttons are
+        # labelled after the window is built (`FocusPanel.apply_step_sizes`),
+        # so a width captured now would be ~50 px short and still clip.
+        controls = self.focus_panel.controls_widget
+        controls.setSizePolicy(QSizePolicy.Policy.Minimum,
+                               QSizePolicy.Policy.Fixed)
 
         self._lv_card = card
+        # The width rule. The panel says when its height or aspect moved and
+        # the card is re-capped to what the frame can actually fill.
+        self._viewer_fit_queued = False
+        self.liveview.fit_changed.connect(self._queue_viewer_fit)
         parent.addWidget(card)
+
+    def _queue_viewer_fit(self) -> None:
+        """
+        Run `_fit_viewer_width` on the next turn of the event loop.
+
+        Deferred because the cap clamps to the card's minimum, and that
+        minimum is STALE at the moment the panel emits — the panel has just
+        changed its own floor, and Qt only recomputes the card's once the
+        layout request it queued has been handled (measured on Qt 6.9; see
+        `ScalingHost.eventFilter`, which exists for the same reason one level
+        up). Coalesced, so a window drag costs one fit per paint rather than
+        one per resize event.
+        """
+        if not self._viewer_fit_queued:
+            self._viewer_fit_queued = True
+            QTimer.singleShot(0, self._fit_viewer_width)
+
+    def _fit_viewer_width(self) -> None:
+        """
+        Cap the live-view card at the width its frame can fill.
+
+        THE SCALING RULE IN CODE. The panel's height is fixed by the window
+        (it is the whole of the viewer row); `LiveViewPanel.ideal_width` turns
+        that into the width a frame of that height needs at its displayed
+        aspect; the card's maximum is set there, plus the card's own margins,
+        so the panel inside comes out exactly frame-shaped. Column 1 is the
+        only stretched column, and Qt's response to a stretched column that
+        has hit its maximum is to give the remaining surplus to the other
+        columns equally — measured on Qt 6.9 with a three-column grid, 0:1:0,
+        middle capped: the sides came out identical. That hand-off is what
+        turns "bars beside the picture" into "wider side panels".
+
+        NEVER BELOW THE CARD'S OWN MINIMUM. Qt drags a widget's minimum down
+        to meet a smaller maximum, silently — so a cap below the minimum
+        would not be ignored, it would let the card be squeezed under the
+        preview's floor and the focus row's width. The clamp is the whole
+        reason this is a method and not one `setMaximumWidth` call.
+
+        Cheap and convergent. Only the panel's height and rotation feed the
+        cap, and neither depends on the card's width, so re-capping cannot
+        change the numbers it was computed from; a width-only relayout does
+        not re-emit `fit_changed` in the first place (see its resizeEvent).
+        """
+        self._viewer_fit_queued = False
+        card = self._lv_card
+        margins = card.layout().contentsMargins()
+        chrome = margins.left() + margins.right()
+        wanted = self.liveview.ideal_width(self.liveview.height()) + chrome
+        floor = card.minimumSizeHint().width()
+        card.setMaximumWidth(max(wanted, floor))
 
     def _build_focus_controls(self):
         """Create the focus panel and wire it. Its widgets are mounted by
@@ -452,7 +734,7 @@ class WindowLayoutMixin:
         conn.addWidget(self._tag("CAMERA"))
         self.btn_connect_camera = QPushButton("Connect")
         self.btn_connect_camera.setToolTip(
-            "Find the camera over USB and open the preview.\n\nIf it fails, the body is probably on Windows' MTP driver — it needs\nWinUSB (via Zadig).")
+            "Find the camera over USB and open the preview.\n\nIf it fails, the body is probably on Windows' MTP driver — it needs\nWinUSB (via Zadig).\n\nStays available while a run is PAUSED, once the run has come to rest:\nit re-opens the link the run is holding, without disturbing the\nfocus range or the preview. Comes alive a moment after Pause —\nthat moment is the run finishing the frame it was on.")
         self.btn_connect_camera.setStyleSheet(
             btn_style("#15803d", "#ffffff", rgba(ACCENT_GREEN, 0.5), "#166534"))
         self.btn_connect_camera.clicked.connect(self._connect_camera)
@@ -475,6 +757,8 @@ class WindowLayoutMixin:
         self.field_baud.setFixedWidth(84)
         conn.addWidget(self.field_baud)
         self.btn_connect_tt = QPushButton("Connect")
+        self.btn_connect_tt.setToolTip(
+            "Open the serial port and shake hands with the controller.\n\nStays available while a run is PAUSED, once the run has come to rest:\nit re-opens the port the run is holding. The port and baud fields stay\nlocked — a mid-run reconnect can only reopen the device the run\nstarted on, so moving to a different COM port needs Stop and Recover.")
         self.btn_connect_tt.setStyleSheet(
             btn_style("#15803d", "#ffffff", rgba(ACCENT_GREEN, 0.5), "#166534"))
         self.btn_connect_tt.clicked.connect(self._connect_tt)
@@ -484,28 +768,75 @@ class WindowLayoutMixin:
         # header, where the thing it toggles is. Two buttons for one piece of
         # state is a sync bug waiting to happen.
 
-        # Devices on the left, destination on the right, rather than three
-        # stacked rows: the destination pair has to stay stacked (a subject
-        # name belongs directly under the folder it names), so stacking the
-        # devices too would make this panel three rows tall in a window with
-        # no spare height at all.
+        # TWO SHAPES, because this card lives in two places. Across the top
+        # of the window (landscape) the devices sit LEFT of the destination
+        # pair: the pair has to stay stacked (a subject name belongs directly
+        # under the folder it names), so stacking the devices too would make
+        # the panel three rows tall in a window with no spare height. In a
+        # side column (portrait) the same row would squeeze the folder field
+        # to a few characters, so there the devices go ABOVE the pair and
+        # the fields get the column's whole width. `_arrange_setup` builds
+        # whichever shape `_arrange` asks for; the pieces are wrapped in
+        # widgets here so they can be re-placed without being rebuilt.
         dest = QVBoxLayout()
         dest.setSpacing(6)
         dest.addLayout(self._make_folder_row())
         dest.addLayout(self._make_subject_row())
 
-        split = QHBoxLayout()
-        split.setSpacing(14)
-        split.addLayout(conn)
-
-        sep = QFrame()
-        sep.setObjectName("hairline")
-        sep.setFixedWidth(1)
-        split.addWidget(sep)
-
-        split.addLayout(dest, 1)
-        card.add(split)
+        self._setup_conn = QWidget()
+        conn.setContentsMargins(0, 0, 0, 0)
+        self._setup_conn.setLayout(conn)
+        self._setup_dest = QWidget()
+        dest.setContentsMargins(0, 0, 0, 0)
+        self._setup_dest.setLayout(dest)
+        self._setup_sep = QFrame()
+        self._setup_sep.setObjectName("hairline")
+        self._setup_body = QWidget()
+        card.add(self._setup_body)
+        self._setup_shape = None
+        self._arrange_setup("wide")
         parent.addWidget(card)
+
+    def _arrange_setup(self, shape: str) -> None:
+        """
+        Lay the Set up card's two halves out `wide` (side by side) or
+        `stacked` (devices over destination). See `_build_setup_card`.
+
+        A widget cannot be handed a second layout while it still owns one,
+        and a layout cannot be deleted from Python while a widget owns it —
+        so the old layout is emptied, handed to a throwaway widget, and goes
+        when that does. The halves are widgets and survive; only the box
+        around them is replaced.
+        """
+        if shape == self._setup_shape:
+            return
+        self._setup_shape = shape
+        body = self._setup_body
+        old = body.layout()
+        if old is not None:
+            while old.count():
+                old.takeAt(0)
+            QWidget().setLayout(old)
+        sep = self._setup_sep
+        if shape == "wide":
+            lay = QHBoxLayout(body)
+            lay.setSpacing(14)
+            sep.setMinimumSize(0, 0)
+            sep.setMaximumSize(1, 16777215)
+            sep.setFixedWidth(1)
+            lay.addWidget(self._setup_conn)
+            lay.addWidget(sep)
+            lay.addWidget(self._setup_dest, 1)
+        else:
+            lay = QVBoxLayout(body)
+            lay.setSpacing(8)
+            sep.setMinimumSize(0, 0)
+            sep.setMaximumSize(16777215, 1)
+            sep.setFixedHeight(1)
+            lay.addWidget(self._setup_conn)
+            lay.addWidget(sep)
+            lay.addWidget(self._setup_dest)
+        lay.setContentsMargins(0, 0, 0, 0)
 
     # ── 5. transport ─────────────────────────────────────────────────
     def _build_transport_card(self, parent):
@@ -522,12 +853,12 @@ class WindowLayoutMixin:
         # biggest, most consequential button in the window and it was sitting
         # hard under the header; the gap gives it a moment of its own.
         #
-        # The stretch below, paired with the one after the estimate line, is
-        # what actually centres the block. This card is the bottom of a column
-        # whose height is set by the Event log beside it, so it gets more room
-        # than its contents need and the surplus has to go somewhere — split
-        # equally above and below, it reads as deliberate spacing rather than
-        # as a panel that ran out of things to say.
+        # The stretch below, paired with the one after the estimate line,
+        # centres the block should the card ever be taller than its contents.
+        # It is content-height at the bottom of the right column now (the dial
+        # above it takes the slack), so the pair mostly sits at zero — kept
+        # because it costs nothing and the card would look wrong without it
+        # the day something hands it spare height again.
         card.body.addSpacing(14)
         card.body.addStretch(1)
 
@@ -1060,7 +1391,7 @@ class WindowLayoutMixin:
         self.field_base = QLineEdit(
             str(Path.home() / "Pictures" / "TurntableStacks"))
         self.field_base.setToolTip(
-            "Base folder. Each subject gets subject/subject_revN/…_posNNN\n"
+            "Base folder. Each subject gets subject/subject_rev-N/…_pos-NNN\n"
             "sub-folders under here.\n\n"
             "Unused when 'Keep photos on the camera card' is on.")
         self.field_base.editingFinished.connect(
@@ -1083,7 +1414,7 @@ class WindowLayoutMixin:
         self.field_stack_name = QLineEdit("placeholder_name")
         self.field_stack_name.setPlaceholderText("e.g. dragon_miniature")
         self.field_stack_name.setToolTip(
-            "Names every folder and file. 'unicorn' gives:\n   unicorn/unicorn_rev1/unicorn_rev1_pos001/unicorn_rev1_0001.jpg\n\nLetters, numbers, - and _ only. Unused with card-only saving.")
+            "Names every folder and file. 'unicorn' gives:\n   unicorn/unicorn_rev-1/unicorn_rev-1_pos-001/\n      unicorn_rev-1_pos-001_shot-0001.NEF\n\nEvery frame carries its own revolution, table position and shot\nnumber, so it still says where it came from once it has been moved\nout of its folder — the file is its folder's name plus the shot.\n\nLetters, numbers, - and _ only. Unused with card-only saving.")
         self.field_stack_name.textChanged.connect(self._on_stack_name_changed)
         row.addWidget(self.field_stack_name, 1)
         return row
@@ -1091,13 +1422,12 @@ class WindowLayoutMixin:
     def _build_progress_card(self, parent):
         card = Card("Progress", ACCENT_BLUE)
         grid = QGridLayout()
-        # SCALED TO FILL, not padded to fit. This card moved from the bottom of
-        # the middle column up into row 1, where the row's height is set by
-        # Options and Timing beside it — so it had ~40 px of dead space under
-        # the last bar. Rather than centre four thin bars in a box too big for
-        # them, the bars themselves grew: 26 px of height each and 14 px
-        # between rows uses the space the row was always going to give this
-        # card. If a fifth bar is ever added, take these back down.
+        # GENEROUS BARS, kept from when this card shared a row with Options
+        # and Timing and had ~40 px of dead space to fill. It is content-height
+        # in the left column now, so 26 px bars with 14 px between them are a
+        # choice about legibility rather than about filling a box; the log
+        # under it absorbs whatever they do not use. If a fifth bar is ever
+        # added, take these back down.
         grid.setSpacing(14)
         grid.setColumnStretch(1, 1)
 
@@ -1194,10 +1524,11 @@ class WindowLayoutMixin:
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.document().setMaximumBlockCount(4000)
-        # Low floor on purpose. It shares the bottom row with Run + Progress,
-        # which together want ~296 px, so the log gets that much for free
-        # without asking — and every pixel it asks for ABOVE that comes
-        # straight out of the preview, which has the better claim on it.
+        # Low floor on purpose. It is the bottom of the left column and takes
+        # whatever height the three content-height cards above it leave, so
+        # on any real monitor it gets far more than this without asking —
+        # and every pixel it DEMANDS is a pixel added to the layout's floor,
+        # which is what decides when the whole window has to scale.
         self.log_view.setMinimumHeight(150)
         card.add(self.log_view)
         card.body.setStretch(0, 1)
@@ -1205,8 +1536,9 @@ class WindowLayoutMixin:
 
     def _build_dial_card(self, parent):
         """
-        Where the table is, at a glance — and it shares the tall viewer row
-        with the live view, so "at a glance" can mean from across the room.
+        Where the table is, at a glance — and it is the card that grows in
+        the right column, so on a big monitor "at a glance" can mean from
+        across the room.
 
         Sized to be GLANCED at, not stared into. It answers one question
         ("where is the table?") and the angle in its header answers it
@@ -1331,7 +1663,13 @@ class WindowLayoutMixin:
         card.add(heads)
         card.add(spin)
         card.body.addSpacing(9)
-        parent.addWidget(card)
+        # Stretch 1: this is the card that grows in the right column. Without
+        # it a QVBoxLayout shares the slack between all three cards equally,
+        # which put a hundred pixels of nothing under Capture's fields and
+        # under Start — and the dial, the one thing that gets better bigger,
+        # got a third of what it could have had. `_Slot` ignores the factor,
+        # so this is harmless if the card is ever handed a grid cell again.
+        parent.addWidget(card, 1)
 
     def _install_shortcuts(self):
         for keys, slot in (("Ctrl+Return", self._start_session),

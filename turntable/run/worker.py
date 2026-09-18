@@ -93,6 +93,10 @@ class BridgeWorker(StackShooterMixin, DeviceRecoveryMixin, QThread):
         self.signals = BridgeSignals()
         self._stop = threading.Event()
         self._pause = threading.Event()
+        # Set only while this thread is ACTUALLY sitting still in
+        # `_wait_if_paused`. Not the same fact as `_pause`, and the difference
+        # is what licenses reconnecting a device mid-run — see `parked`.
+        self._parked = threading.Event()
         self._file_wait_misses = 0
         self._verbose_moves = True      # narrate the first stack only
         self._did_complete_beep = False
@@ -131,8 +135,50 @@ class BridgeWorker(StackShooterMixin, DeviceRecoveryMixin, QThread):
             self.signals.log.emit("Paused.", ACCENT_AMBER)
 
     def _wait_if_paused(self):
-        while self._pause.is_set() and not self._stop.is_set():
-            time.sleep(0.05)
+        if not self._pause.is_set() or self._stop.is_set():
+            return
+        self._parked.set()
+        try:
+            while self._pause.is_set() and not self._stop.is_set():
+                time.sleep(0.05)
+        finally:
+            self._parked.clear()
+
+    @property
+    def parked(self) -> bool:
+        """
+        Is this run sitting still, with no command in flight on either device?
+
+        NOT the same question as "is it paused", and the gap between the two is
+        a real window rather than a technicality. `toggle_pause` runs on the GUI
+        thread: it sets `_pause` and emits status "paused" immediately, but this
+        thread does not notice until its next `_gate()`. In between, the run is
+        labelled paused while a capture is still committing — `ptp.capture`
+        waits out the exposure and the image commit with a 180 s ceiling — or
+        while the table is still turning. Anything that closes a transport on
+        the strength of the label alone would be closing it mid-command.
+
+        `_parked` is set from inside the wait loop, so it answers the question
+        the label cannot. There are four park points, and all four sit BETWEEN
+        device operations rather than inside one: the top of the round loop and
+        the top of the stack loop in `run`, the top of the per-photo loop in
+        `stacking._shoot_stack`, and the between-revolutions hold. So while this
+        is set, neither device has anything outstanding and the transport can be
+        closed and reopened underneath us safely — the next command re-opens it
+        through `PTPCameraClient._ensure`, exactly as recovery already does.
+
+        DELIBERATELY FALSE DURING A DROP-OUT WAIT. `_wait_for_device` does not
+        come through here: it polls `ready()` every 1.5 s, and for the table
+        that poll IS `tt.reconnect()`. The run is waiting for the user there,
+        but it is waiting *actively*, and a second reconnect racing the poll on
+        the same object is not something to invite. It needs no help either —
+        that loop picks the device up by itself the moment it answers.
+
+        Read by `MainWindow._run_is_parked` to decide whether the two Reconnect
+        buttons are live. Nothing else should key off it: it is a statement
+        about this thread's position, not a run state.
+        """
+        return self._parked.is_set()
 
     def _check_stop(self):
         if self._stop.is_set():
@@ -141,6 +187,63 @@ class BridgeWorker(StackShooterMixin, DeviceRecoveryMixin, QThread):
     def _gate(self):
         self._wait_if_paused()
         self._check_stop()
+
+    @staticmethod
+    def _stack_folder(base: "Path", subject: str, round_idx: int, position: int,
+                      rev_name: str, pos_name: str) -> "Path":
+        """
+        Where this stack's frames go — preferring an older run's folders if it
+        already has some here.
+
+        The tree is `base/subject/subject_rev-1/subject_rev-1_pos-001/`, which
+        matches the filenames inside it exactly: a frame is its folder's name
+        plus `_shot-NNNN`. It has not always been spelled that way. Before the
+        position went into filenames, the folders read `..._rev1` and
+        `..._pos001`, with no hyphens.
+
+        THAT MATTERS FOR ONE CASE ONLY, AND IT IS THE CASE THAT WOULD HURT.
+        Nothing reads these names, and a fresh run is free to spell them
+        however it likes — but a **Recover** re-derives the folder from the
+        checkpoint's revolution and position numbers, so a run that was
+        interrupted under the old spelling would come back, compute a new-style
+        path, and quietly start a second tree beside the one already holding
+        that subject's frames. Nothing would be lost and nothing would say so;
+        the user would simply find their shoot split across `unicorn_rev3` and
+        `unicorn_rev-3` and have to work out why.
+
+        So: use the new name, unless the old one is already there. Checked by
+        `is_dir` rather than by remembering a version anywhere, which means it
+        needs no migration, no flag, and no cleanup — the day the last
+        old-style folder is gone, this stops finding anything and the fallback
+        costs one stat per stack forever after. Deliberately NOT recursive and
+        deliberately not a rename: moving a user's data to tidy up a naming
+        change is a far bigger promise than continuing to write where they
+        already are.
+
+        The FILENAMES do not fall back. They are built from the canonical parts
+        by the caller, so a resumed old session gets today's names inside
+        yesterday's folders — which is what was asked for, and which the
+        `_recaptured` tag makes legible anyway.
+
+        DECIDED PER REVOLUTION, NOT PER POSITION, and that is the whole of the
+        subtlety here. Matching on the position folder alone looked right and
+        was tested wrong: a revolution interrupted at position 1 put that one
+        position back in the old folder and every position after it — none of
+        which had been reached, so none of which existed — in a new one. The
+        revolution ended up split across `unicorn_rev3` and `unicorn_rev-3`,
+        which is a worse version of the mess this exists to avoid. Asking the
+        question one level up answers it once for all 39 positions.
+
+        If both spellings exist, the new one wins: that means a run has already
+        been writing there, and following it is what keeps a second Recover
+        landing where the first one did.
+        """
+        subject_dir = base / subject
+        current_rev = subject_dir / rev_name
+        legacy_rev = subject_dir / f"{subject}_rev{round_idx}"
+        if not current_rev.is_dir() and legacy_rev.is_dir():
+            return legacy_rev / f"{subject}_rev{round_idx}_pos{position:03d}"
+        return current_rev / pos_name
 
     def _log(self, text, color=TEXT_SECONDARY):
         self.signals.log.emit(text, color)
@@ -192,7 +295,6 @@ class BridgeWorker(StackShooterMixin, DeviceRecoveryMixin, QThread):
         first_stack = True          # first stack of ANY run returns the lens to A
         resume_stack_start = cp0.stack_in_round if cp0 else 0
         recapture_pending = bool(cp0 and self._recapture_first)
-        self._current_tmpl: Optional[str] = None    # last filename template set
         last_plan: Optional[Tuple[int, int]] = None
 
         if cp0:
@@ -406,11 +508,14 @@ class BridgeWorker(StackShooterMixin, DeviceRecoveryMixin, QThread):
                     self.signals.stack_changed.emit(stack_in_round, stacks_per_round)
                     self.signals.images_changed.emit(0, photo_count)
 
-                    # Three self-describing levels:
-                    #   base/unicorn/unicorn_rev1/unicorn_rev1_pos001/
-                    rev_name = f"{name}_rev{round_idx}"
-                    pos_name = f"{rev_name}_pos{stack_in_round + 1:03d}"
-                    stack_folder = base_folder / name / rev_name / pos_name
+                    # Three self-describing levels, spelled exactly as the
+                    # filenames inside them:
+                    #   base/unicorn/unicorn_rev-1/unicorn_rev-1_pos-001/
+                    rev_name = f"{name}_rev-{round_idx}"
+                    pos_name = f"{rev_name}_pos-{stack_in_round + 1:03d}"
+                    stack_folder = self._stack_folder(
+                        base_folder, name, round_idx, stack_in_round + 1,
+                        rev_name, pos_name)
 
                     self._log(
                         f"Revolution {round_idx}, position {stack_in_round + 1}"
@@ -429,19 +534,60 @@ class BridgeWorker(StackShooterMixin, DeviceRecoveryMixin, QThread):
                                 "frames to keep for this position.", ACCENT_CYAN)
                     else:
                         stack_folder.mkdir(parents=True, exist_ok=True)
-                        # Filename template for this stack. A re-captured stack
-                        # gets a _recaptured tag so its frames never collide with
-                        # (or get confused for) whatever the interrupted attempt
-                        # left behind.
+                        # ── FILENAME FOR THIS STACK ──────────────────
+                        #   subject_rev-1_pos-007_shot-0002.NEF
+                        #
+                        # EVERY COORDINATE OF THE FRAME IS IN ITS OWN NAME:
+                        # which revolution, which position on the table, which
+                        # shot in the focus stack. The folder tree carries the
+                        # same three facts, and that used to be considered
+                        # enough — the name held only the revolution and a
+                        # counter. It is not, because a file's folder is the
+                        # first thing it loses. Dragged into a stacker, exported
+                        # flat, or handed to someone else, a frame called
+                        # `..._rev1_0002` cannot say which of 39 positions it
+                        # belongs to, and two positions' frames become
+                        # indistinguishable the moment they share a directory.
+                        #
+                        # BUILT FROM `pos_name`, so the file and the folder it
+                        # sits in cannot drift apart: a frame is exactly its
+                        # folder's name plus `_shot-NNNN`. They were briefly
+                        # allowed to disagree — folders saying `_rev1_pos001`
+                        # while files said `_rev-1_position-001` — which is two
+                        # spellings of one fact in a single path, and the sort
+                        # of thing that is obvious the week it lands and
+                        # invisible six months later. Note this is the CANONICAL
+                        # `pos_name`,
+                        # not `stack_folder.name`: a resumed old-style session
+                        # writes today's filenames into yesterday's folders
+                        # rather than reviving the old spelling (see
+                        # `_stack_folder`).
+                        #
+                        # The position is 3 digits and the shot 4, so both sort
+                        # correctly in any file browser. The revolution is NOT
+                        # padded, so rev-10 sorts before rev-2 if revolutions
+                        # are ever pooled into one directory.
+                        #
+                        # A re-captured stack keeps its `_recaptured` tag, ahead
+                        # of the shot number so the second attempt's frames group
+                        # together rather than interleaving with the abandoned
+                        # ones they sit beside.
                         suffix = "_recaptured" if recapture_this else ""
-                        desired_tmpl = f"{rev_name}{suffix}_[Counter 4 digit]"
-                        if desired_tmpl != self._current_tmpl:
-                            try:
-                                self.camera.set_filename_template(desired_tmpl)
-                                self._current_tmpl = desired_tmpl
-                            except Exception as e:          # noqa: BLE001
-                                self._log(f"Could not set filename template: "
-                                          f"{e}", ACCENT_AMBER)
+                        desired_tmpl = f"{pos_name}{suffix}_shot-[Counter 4 digit]"
+                        # SET EVERY STACK, not only when it changes. It used to
+                        # be guarded by a `!= last template set` check, worth
+                        # having when the template only carried the revolution
+                        # and so was identical for 39 stacks in a row. Now that
+                        # the position is in it the template differs every time,
+                        # so the guard could never hit — and it was guarding
+                        # nothing anyway: `set_filename_template` assigns a
+                        # string on this side of the USB link and sends the
+                        # camera nothing at all.
+                        try:
+                            self.camera.set_filename_template(desired_tmpl)
+                        except Exception as e:              # noqa: BLE001
+                            self._log(f"Could not set filename template: "
+                                      f"{e}", ACCENT_AMBER)
 
                         stale = count_images_in(stack_folder)
                         if recapture_this:

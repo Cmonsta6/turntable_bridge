@@ -131,10 +131,52 @@ one after each move, so the final stack lands back where it began.
 Files land in:
 
 ```
-<base folder>/<subject>/<subject>_rev1/<subject>_rev1_pos001/
+<base folder>/<subject>/<subject>_rev-1/<subject>_rev-1_pos-001/
+    <subject>_rev-1_pos-001_shot-0001.NEF
 ```
 
+Every frame names its own three coordinates — which revolution, which position
+on the table, which shot in the focus stack — so it still says where it came
+from after it has been dragged out of its folder into a stacker or exported
+flat. A file is exactly its folder's name plus `_shot-NNNN`, so the two can
+never drift apart.
+
+Position and shot are zero-padded and sort correctly; the revolution is not, so
+pool revolutions into one directory and `rev-10` sorts before `rev-2`.
+Re-captured stacks keep their `_recaptured` tag, ahead of the shot number. The
+extension is whatever the camera sends — `.NEF` on a Nikon; nothing here
+converts to DNG.
+
+Folders were once spelled `_rev1` / `_pos001`, without the hyphens. A run
+**recovered** into a session shot that way carries on writing into the folders
+it already filled rather than starting a second tree beside them; only the
+filenames inside are current. Nothing is renamed or moved.
+
 ### Things worth knowing
+
+**⟳ rotates the preview**, for a camera mounted in portrait. The body streams
+live view in its own sensor orientation and never reports which way up it is
+bolted, so a camera on its side sends an ordinary landscape frame with the
+subject lying down in it. Click to step 0° → 90° → 180° → 270° → 0°; the button
+shows the current angle, and it is remembered between sessions because the
+camera stays mounted. It needs no camera connected, so you can set it in advance.
+
+This is a **display setting only** — saved photos are the camera's own bytes and
+are never rotated or re-encoded by it. The window re-arranges itself to match:
+at 90° or 270° the Set up panel moves into the left column so a portrait frame
+gets the full window height, and at 0° or 180° the wide layout comes back. The
+swap is live, works mid-run, and keeps every setting. With no camera connected
+the preview draws a dashed outline of where the frame will sit.
+
+**Single shot**, at the right-hand end of the live-view header, takes one photo
+immediately. The table does not turn and the focus does not move — it captures
+exactly what the preview is showing, which makes it the test exposure for
+checking the light, the framing and the focus plane before committing to a run.
+Frames land in `<base folder>/<subject>_singleshots/`, numbered, and never
+overwrite an earlier one. That folder sits *beside* `<subject>/` rather than
+inside it, so a test frame is never mistaken for part of a stack, and a single
+shot is always pulled to the PC even with *Keep photos on the camera card*
+ticked — otherwise there would be nothing in the folder to look at.
 
 **Most settings are live.** Change a timing mid-run and it takes effect on the
 next use. The exceptions are the ones that would be incoherent applied halfway:
@@ -157,6 +199,28 @@ past the end of the lens.
 answering, the run pauses, sounds an alarm and waits for the device to come back
 rather than dying at 3am. A checkpoint is written at every stack, so an
 interrupted run can be resumed with **Recover**.
+
+**STOP escalates if the run does not hear it.** Stop normally just asks the run
+to finish what it is doing and end, which takes a fraction of a second. If the
+run is instead stuck in a device call that is not coming back, pressing Stop
+again — or waiting four seconds — cuts the turntable's serial port out from
+under it, which forces the stuck call to return and lets the run end through its
+ordinary Stop path. The last stack's checkpoint is intact, so **Recover** carries
+on from there: reconnect the table first. The camera is deliberately left alone,
+because every camera call already has a timeout and unwinds on its own.
+
+**Both Reconnect buttons keep working while a run is paused** — whether you
+pressed Pause or a revolution ended on a hold. Each re-opens that device's link
+in place without ending the run, which is what you want for a knocked USB cable
+or a table that needs a power cycle. Press Resume when the device is back.
+
+They come alive a *moment* after Pause, not instantly, and that moment is the
+run finishing the frame or the move it was on: pausing asks the run to stop, and
+until it actually stops, reconnecting would close the link mid-command. The COM
+port and baud fields stay locked, because a mid-run reconnect can only reopen
+the device the run started on — moving the table to a different port needs Stop
+and then Recover. During an automatic drop-out wait the buttons stay off, since
+that loop is already reconnecting by itself every second and a half.
 
 **Keep photos on the camera card** skips the USB download and is much faster,
 but nothing reaches the PC — so those files are not renamed or foldered, and the

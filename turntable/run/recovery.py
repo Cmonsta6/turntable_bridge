@@ -193,9 +193,15 @@ class DeviceRecoveryMixin:
                 return
             except Exception as e:          # noqa: BLE001
                 # A REAL controller error from an OPEN port is not retryable —
-                # reconnecting won't change it. Everything else (a bare timeout,
-                # or a CLOSED-port TurntablePortClosed, e.g. Windows hasn't
-                # released the COM port yet after a reconnect) is recoverable.
+                # reconnecting won't change it. Everything else is recoverable:
+                # a bare timeout; a CLOSED-port TurntablePortClosed (e.g.
+                # Windows hasn't released the COM port yet after a reconnect);
+                # and TurntableWriteTimeout, which is a TurntablePortClosed
+                # subclass precisely so it lands here — an open port that will
+                # not take bytes wants reopening, not a run abandoned. That last
+                # one used to be a HANG rather than an exception, because the
+                # port was opened with no write timeout at all; see
+                # `ComximClient.WRITE_TIMEOUT_S`.
                 if (isinstance(e, TurntableError)
                         and not isinstance(e, TurntablePortClosed)
                         and self.tt.is_open):

@@ -34,6 +34,7 @@ from ..hardware.camera import PTPCameraClient
 from ..hardware.focus import (
     STEP_UNITS, plan_focus_intervals, step_ratios,
 )
+from ..hardware.images import list_image_names
 from ..hardware.settings import LiveSettings
 from ..run.checkpoint import RunCheckpoint
 from ..run.worker import BridgeWorker
@@ -54,11 +55,39 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
     # Same reason: the focus panel raises live view from ITS worker thread, and
     # the preview widget it needs to wake lives on the GUI thread.
     _lv_started = Signal()
+    # And again for the single shot, which fires on a thread of its own so the
+    # window does not freeze for the length of a frame. The path written, or
+    # the reason nothing was.
+    _shot_done = Signal(str)
+    _shot_failed = Signal(str)
 
     def __init__(self):
         super().__init__()
         self._log_relay.connect(self._append_log)
         self._lv_started.connect(self._show_preview)
+        self._shot_done.connect(self._on_shot_done)
+        self._shot_failed.connect(self._on_shot_failed)
+        # A single shot is in flight. Read by `_update_button_states`, which
+        # runs before the first shot can ever be taken, so it is set here
+        # rather than lazily.
+        self._shooting = False
+        self._shot_resume_preview = False
+        # A user-driven reconnect is in flight. Separate from `_shooting`
+        # because they are separate facts — `_after_shot` restores the preview
+        # and a reconnect must not — but both hold the same link, so both are
+        # read through `_link_busy`.
+        self._reconnecting = False
+        # Last `_run_is_parked()` the tick saw, so the buttons are refreshed
+        # when a paused run actually comes to rest rather than every second.
+        self._parked_seen = False
+        # Has Stop been asked for on the current run? Drives the escalation in
+        # `_stop_session`: a second press cuts links rather than repeating a
+        # request the run has already proved it cannot hear.
+        self._stop_requested = False
+        # Why the last pre-run SETSTOP failed, or None. Read by
+        # `_table_link_ready` — a table that will not take a command before the
+        # run starts will not take one during it either.
+        self._tt_stop_error: Optional[str] = None
         self._debug_file = None
         self._liveview_opened = False
         # LiveView-for-focus state: shut any stale LiveView and open a clean
@@ -131,6 +160,10 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         # 44x17 and opens a 68x57 window. showEvent defers it — see there.
         self._geometry_applied = False
         self._greet()
+        # After the greeting so its note reads as a follow-up rather than the
+        # first thing in the log, and unconditional — the rotation is a display
+        # setting, so it applies whether or not the hardware layer imported.
+        self._restore_rotation()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -164,6 +197,14 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
     SETTINGS_ORG = "TurntableBridge"
     SETTINGS_APP = "TurntableBridge"
     GEOMETRY_KEY = "window/geometry"
+    #: Preview rotation, remembered because it describes the RIG rather than a
+    #: session — a camera bolted in portrait is still in portrait tomorrow, and
+    #: re-setting it on every launch would be a chore with no purpose. Kept
+    #: beside the geometry key because it is the same kind of fact: how the
+    #: window should look, not what the run should do. Deliberately NOT in
+    #: `_collect_settings`; the worker has no use for it and must not acquire
+    #: one, since nothing about a saved frame depends on it.
+    LIVEVIEW_ROTATION_KEY = "liveview/rotation"
 
     #: Quiet period before a move or resize is written. A drag emits events
     #: continuously, and writing on each one would put hundreds of registry
@@ -231,10 +272,11 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         """
         Open at the natural size of the content, capped to the screen.
 
-        The content widget's own sizeHint is the whole answer now the layout
-        is a stack of full-width bands — every panel contributes its natural
-        height and the viewer row contributes the preview's, which is the
-        camera's 750x500 frame plus the focus controls under it.
+        The content widget's own sizeHint is the whole answer: the Set up bar
+        contributes its height, the viewer row the taller of its three columns
+        — which is the preview's generous `sizeHint`, so the window asks for
+        as much height as the screen will give — and the width is the two
+        side columns plus what the preview would like.
 
         CAPPED, NOT CLIPPED, and that cap is what makes this resolution
         independent. Ask for the natural size, take the smaller of it and the
@@ -305,17 +347,15 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         if getattr(self, "_geometry_applied", False):
             self._queue_geometry_save()
 
-    # NOTE ON THE LETTERBOX, because it was deliberately removed and then
-    # deliberately put back. The live-view card spans all three grid columns,
-    # which is what makes the panels beneath it line up with the ones above.
-    # A card that spans cannot also be pinned to the frame's aspect, so where
-    # the card is wider than `height x 1.5` the frame is centred with card
-    # background either side.
-    #
-    # No arrangement avoids that AND keeps the column alignment: a full-width
-    # row at this window's proportions is simply wider than 3:2. An earlier
-    # build pinned the card's width instead and let the dial column absorb the
-    # difference; the alignment was judged worth more than the bars.
+    # NOTE ON THE LETTERBOX, because it was removed, put back, and has now
+    # been removed a second time by a different route. The live-view card
+    # used to span all three grid columns as a band, which lined the panels
+    # beneath it up with the ones above but left the frame drawing at a
+    # fraction of a box far wider than 3:2 — and a seventh of it when rotated
+    # to portrait. The card is now the whole MIDDLE COLUMN instead, and its
+    # width is capped on every resize and rotation at what its frame can fill
+    # (`layout._fit_viewer_width`), with the side columns absorbing the rest.
+    # The full reasoning is the map at the top of layout.py.
 
     def _greet(self):
         """The first lines in the event log, once the window is built."""
@@ -630,10 +670,46 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
     # ══════════════════════════════════════════════════════════════════
     # Connections
     # ══════════════════════════════════════════════════════════════════
+    def _link_busy(self) -> bool:
+        """
+        Is the window itself holding a device link right now?
+
+        The union of the two things it can be doing on its own account — a
+        single shot and a user-driven reconnect. Both take a camera link that
+        something else may want, so everything that would compete is held off
+        for the length of either, and neither may start while the other runs.
+        """
+        return self._shooting or self._reconnecting
+
+    def _run_is_parked(self) -> bool:
+        """
+        Is a run in progress AND sitting genuinely still?
+
+        True while a paused run — whether the user pressed Pause or a
+        revolution ended on a hold — is waiting inside `BridgeWorker.parked`,
+        which is only set between device operations. That property carries the
+        reasoning, including why the drop-out waits ("nocamera"/"notable")
+        deliberately do not count.
+
+        This is what makes the two Reconnect buttons live mid-run, and it is
+        checked again inside each of them rather than trusted from the button
+        state: a run can leave the parked state at any moment (the user presses
+        Resume) and a click already in flight would arrive just after.
+        """
+        w = self._worker
+        return (w is not None and self._status == "paused"
+                and not self._link_busy() and w.parked)
+
     def _connect_camera(self):
         if not HARDWARE_AVAILABLE:
             self._append_log("Hardware layer not available "
                              "(pip install pyserial).", ACCENT_RED)
+            return
+
+        # A run is up and at rest: re-open the link the run is already holding
+        # rather than building a replacement it would never see.
+        if self._worker is not None:
+            self._reconnect_camera_in_run()
             return
 
         if self._camera is not None:
@@ -705,6 +781,82 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
             self._append_log(f"Camera connection failed: {e}", ACCENT_RED)
 
         self._update_button_states()
+
+    def _reconnect_camera_in_run(self):
+        """
+        Re-open the camera link while a paused run holds it.
+
+        IN PLACE, ON THE SAME CLIENT OBJECT, which is the whole reason this is a
+        separate method rather than a flag on `_connect_camera`. `BridgeWorker`
+        is handed `camera=self._camera` at construction and keeps that
+        reference for its lifetime, so building a fresh `PTPCameraClient` here
+        and assigning it to `self._camera` would leave the run driving the old,
+        closed one — a reconnect that appears to work, reports success, and
+        breaks the run at its next frame. `close()` plus a `verify_connection()`
+        that re-opens through `_ensure` gives the identical result without
+        touching identity, and is what `_recover_camera` already does.
+
+        IT DOES MUCH LESS THAN A COLD CONNECT, deliberately. The full path also
+        starts the preview, re-reads the magnifier steps and kicks off an
+        automatic lens calibration — and that last one drives the lens to both
+        mechanical stops and clears A and B. Mid-run that is not a reconnect,
+        it is a destroyed session. The preview is no better: `liveview.start()`
+        calls `show_liveview()` directly, which does not go through the run's
+        `hold_liveview_closed`, so it would raise a live-view session the user
+        explicitly asked to keep shut for the run and compete with it for the
+        link. None of that belongs here. What is left is the link itself, the
+        pill and a log line.
+
+        Nothing is re-pointed at the camera either (`focus_panel.set_camera`,
+        `liveview.set_camera`) because they already hold this same object.
+        """
+        if not self._run_is_parked():
+            self._append_log(
+                "The run has not come to rest yet — wait for it to finish the "
+                "frame it is on, then reconnect.", ACCENT_AMBER)
+            return
+        if self._camera is None:                    # cannot happen with a run up
+            return
+
+        self.pill_camera.set_state("reconnecting…", ACCENT_AMBER)
+        # Latched because of the processEvents below: without it, a second click
+        # queued while the pill repainted would be delivered straight into a
+        # reconnect already under way.
+        self._reconnecting = True
+        self._update_button_states()
+        QApplication.processEvents()
+        try:
+            self._camera.close()
+            name = self._camera.verify_connection()
+            self.pill_camera.set_state("connected", ACCENT_GREEN)
+            self._append_log(
+                f"Camera link re-opened mid-run — "
+                f"{'no model reported' if name == CAMERA_UNKNOWN else name}. "
+                f"The run picks it up from here; press Resume when ready.",
+                ACCENT_GREEN)
+            # Worth saying out loud, because it is invisible and it is the one
+            # way a successful reconnect can still ruin a run. Switching the
+            # body off and on is the usual reason to press this, and a body that
+            # has been power-cycled may have parked its lens — which moves the
+            # focus plane without moving the app's step counter, so A and B now
+            # point somewhere else. Nothing here can detect that: PTP reports no
+            # absolute lens position, which is why the counter exists at all.
+            self._append_log(
+                "If the camera was switched off and on, the lens may have "
+                "parked itself — A and B would then be measured from the wrong "
+                "place. Stop, press Home, and set them again if the next stack "
+                "looks wrong.", ACCENT_AMBER)
+        except Exception as e:                              # noqa: BLE001
+            # The client is left CLOSED, not None: the worker holds this object
+            # and `_ensure` re-opens it on the next command, so a failure here
+            # costs nothing the run's own recovery cannot still fix.
+            self.pill_camera.set_state("failed", ACCENT_RED)
+            self._append_log(
+                f"Could not re-open the camera: {e}. The run will keep trying "
+                f"by itself when it resumes.", ACCENT_RED)
+        finally:
+            self._reconnecting = False
+            self._update_button_states()
 
     def _toggle_liveview(self, checked: bool):
         if checked:
@@ -779,6 +931,148 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         self.liveview.pause(reason)
         self.btn_liveview.setChecked(False)
         self.btn_liveview.setText("Start live view")
+
+    # ── single shot ──────────────────────────────────────────────────
+    def _singleshot_folder(self) -> Path:
+        """
+        Where the single-shot button writes: <base>/<subject>_singleshots.
+
+        BESIDE the run's tree, not inside it. A run builds
+        base/subject/subject_rev-N/subject_rev-N_pos-NNN, and everything in a
+        position folder is treated as one focus stack — `worker.run` already
+        warns when it finds stale frames there and says they "will be mixed in
+        with this stack". A test exposure dropped anywhere under `subject/`
+        would be exactly that kind of contamination, with the added confusion
+        of being a frame nobody remembers shooting. At the top level, next to
+        `subject/`, it still says which subject it belongs to while being
+        somewhere no run ever looks.
+        """
+        base = Path(self.field_base.text().strip() or Path.home()).expanduser()
+        return base / f"{self._safe_stack_name()}_singleshots"
+
+    def _single_shot(self):
+        """
+        Fire one frame, now, into <base>/<subject>_singleshots.
+
+        The table does not turn and the focus does not move: this captures
+        exactly what the preview is showing. It is the test exposure you want
+        before committing to a run — check the light, the framing, and that the
+        focus plane you just set is actually where you think it is.
+
+        OFF THE GUI THREAD, like every focus control, because a capture is not
+        quick. `ptp.capture` waits out the exposure AND the image commit, and
+        its budget for the latter is CAPTURE_SETTLE_S (180 s); inline, that
+        would freeze the window for the whole frame.
+
+        THE PREVIEW IS PAUSED FOR THE DURATION, which is not tidiness. The
+        transport serialises one TRANSACTION at a time, not one sequence, so a
+        live-view poll can land between `capture()` announcing the SDRAM object
+        and `shoot()` reading it back — the window
+        LiveViewProhibitCondition bit 12, "pending unretrieved SDRAM image",
+        exists to describe. A run avoids this by pausing the feed for its whole
+        length (`_pause_liveview`); this pauses it for a second or two and puts
+        it straight back.
+
+        The live-view SESSION is left alone, and only the poll is stopped,
+        because capture does not care either way: measured on this rig's Z 6_2
+        on 2026-08-03, two consecutive frames with the stream down came out as
+        real 31.6 MB NEFs matching a stream-up control, with 0xD1A4 clean after
+        every one (numbers in the `chk_close_lv` note in ui/layout.py). Closing
+        the session would only cost the next focus command a state change to
+        wait out.
+
+        The focus panel is locked for the same reason the feed is paused — see
+        `FocusPanel.busy`.
+        """
+        if self._shooting:
+            return
+        if self._camera is None:
+            self._append_log("Connect the camera before taking a single shot.",
+                             ACCENT_AMBER)
+            return
+        if self._worker is not None:
+            self._append_log(
+                "A session is running — it owns the USB link. Single shots are "
+                "for before or after a run.", ACCENT_AMBER)
+            return
+        if self.focus_panel.busy:
+            self._append_log(
+                "A focus move is still finishing — take the single shot again "
+                "in a moment.", ACCENT_AMBER)
+            return
+
+        folder = self._singleshot_folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "Bad folder",
+                                f"Cannot write to {folder}:\n{e}")
+            return
+
+        # Numbered from what is already in the folder, so the second shot does
+        # not read as the first. A STARTING POINT ONLY: `ptp.shoot` adds a
+        # numeric suffix rather than overwriting, so a miscount here costs a
+        # name and never a frame.
+        stem = (f"{self._safe_stack_name()}_single_"
+                f"{len(list_image_names(folder)) + 1:03d}")
+
+        if self.chk_keep_on_cam.isChecked():
+            self._append_log(
+                "'Keep photos on the camera card' is on for runs, but a single "
+                "shot is always pulled to the PC — otherwise there would be "
+                "nothing in the folder.", ACCENT_CYAN)
+
+        self._shooting = True
+        self._shot_resume_preview = self.liveview.streaming
+        if self._shot_resume_preview:
+            self.liveview.pause("taking a single shot…")
+        self.focus_panel.set_enabled(False)
+        # Disabled, not relabelled. The header's two ends were given matching
+        # minimum widths at build time from their own sizeHints
+        # (`Card.center_header_group`), so a button that changed width mid-shot
+        # would nudge the centred lens-button group sideways and back.
+        self._update_button_states()
+        self._append_log(f"Single shot → {folder.name}/{stem}", ACCENT_AMBER)
+
+        camera = self._camera
+
+        def _run():
+            try:
+                self._shot_done.emit(str(camera.capture_to(folder, stem)))
+            except Exception as e:                          # noqa: BLE001
+                self._shot_failed.emit(str(e))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _after_shot(self):
+        """Give the link back to the preview and the focus panel."""
+        self._shooting = False
+        self.focus_panel.set_enabled(True)
+        # Only if this shot was the thing that stopped it, and only if nothing
+        # else has taken the link meanwhile.
+        if self._shot_resume_preview and self._worker is None:
+            self.liveview.resume()
+        self._shot_resume_preview = False
+        self._update_button_states()
+
+    def _on_shot_done(self, path: str):
+        self._after_shot()
+        if path and path != "OK":
+            self._append_log(f"Single shot saved — {path}", ACCENT_GREEN)
+        else:
+            # Only reachable if the camera fired but handed back no file, which
+            # `capture_to` does not do on this path — say so plainly rather
+            # than reporting a save that did not happen.
+            self._append_log(
+                "The shutter fired but no file came back — nothing was saved.",
+                ACCENT_AMBER)
+
+    def _on_shot_failed(self, msg: str):
+        self._after_shot()
+        # The shutter may well have fired anyway: the trigger and the transfer
+        # fail separately, which is why nothing in this app re-fires a capture
+        # on the strength of an error alone (see `ptp.capture`).
+        self._append_log(f"Single shot failed: {msg}", ACCENT_RED)
 
     # ── free spin ────────────────────────────────────────────────────
     #: `CT+SETSPEED` grade for each speed button, indexed by ARROW COUNT - 1.
@@ -870,10 +1164,17 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         """
         was_spinning = self._spin_dir is not None
         self._spin_dir, self._spin_level = None, 0
+        # Cleared and re-set on every call, so `_table_link_ready` reads the
+        # outcome of THIS stop and not a stale one. It is recorded rather than
+        # only logged because this failing on the run path is not cosmetic —
+        # it is proof the link is already dead, and the run that followed one
+        # of these hung on its first rotation 25 seconds later.
+        self._tt_stop_error = None
         if self._tt is not None:
             try:
                 self._tt.stop()
             except Exception as e:                           # noqa: BLE001
+                self._tt_stop_error = str(e)
                 if not quiet:
                     self._append_log(f"Could not stop the table: {e}",
                                      ACCENT_AMBER)
@@ -913,7 +1214,13 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         which key stops it, since the buttons toggle and pressing the lit one
         is what halts the table.
         """
-        live = self._tt is not None and self._worker is None
+        # `is_open` as well as not-None, because the two can now differ: a Stop
+        # that escalated closes the port and leaves the client in place
+        # (`_force_stop_table`). Without this the speed buttons came back
+        # looking live on a closed port and every press logged a
+        # TurntablePortClosed instead of turning anything.
+        live = (self._tt is not None and self._tt.is_open
+                and self._worker is None)
         for direction, btns in ((1, self.btns_spin_ccw),
                                 (0, self.btns_spin_cw)):
             for level, b in enumerate(btns):
@@ -1050,6 +1357,69 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
             pass                    # never let tidying up break a run
         self._refresh_zoom(0)
 
+    # ── preview rotation ─────────────────────────────────────────────
+    def _step_rotation(self):
+        """
+        Advance the preview one quarter turn clockwise, and remember it.
+
+        NEEDS NO CAMERA AND NO LIVE VIEW, unlike every other control in this
+        group. It is a fact about how the body is mounted, so it can be set
+        before connecting and it survives a run, a disconnect and a restart —
+        `LiveViewPanel.set_rotation` carries why this cannot reach a saved
+        frame.
+        """
+        options = self.liveview.ROTATIONS
+        nxt = options[(options.index(self.liveview.rotation) + 1) % len(options)]
+        self._apply_rotation(nxt)
+        self._append_log(
+            f"Preview rotated to {nxt}° — display only, saved photos are "
+            f"unchanged." if nxt else
+            "Preview back to its original orientation.", ACCENT_CYAN)
+
+    def _apply_rotation(self, degrees: int, persist: bool = True):
+        """Set the rotation, re-place the cards if needed, relabel, store."""
+        # The window is ARRANGED for the frame's family — see the two maps
+        # in layout.py. Done before the panel turns, so the width cap that
+        # `set_rotation` triggers is computed inside the new arrangement.
+        # `_arrange` is a no-op when the family did not change (0° to 180°).
+        self._arrange(self.orientation_for(degrees))
+        self.liveview.set_rotation(degrees)
+        # The panel's floor turns with it (750x500 <-> 500x750). Nothing more
+        # to do here about the window: the card re-caps itself off the
+        # panel's `fit_changed`, and `ScalingHost` watches the content for the
+        # layout request that follows and re-fits the whole interface if the
+        # new floor no longer fits the window.
+        self.btn_rotate.setText(f"⟳ {degrees}°")
+        if not persist:
+            return
+        try:
+            self._settings().setValue(self.LIVEVIEW_ROTATION_KEY, degrees)
+        except Exception:                                    # noqa: BLE001
+            pass                    # a preference nobody should lose a run over
+
+    def _restore_rotation(self):
+        """
+        Re-apply the remembered rotation at startup.
+
+        Anything unreadable, stale or hand-edited falls back to upright rather
+        than raising: `set_rotation` rejects a value that is not a quarter turn,
+        and this runs during window construction where an exception would mean
+        no window at all.
+        """
+        try:
+            saved = int(self._settings().value(self.LIVEVIEW_ROTATION_KEY, 0))
+        except (TypeError, ValueError):
+            saved = 0
+        if saved not in self.liveview.ROTATIONS:
+            saved = 0
+        # persist=False: restoring is not a change, and writing here would turn
+        # every launch into a settings write.
+        self._apply_rotation(saved, persist=False)
+        if saved:
+            self._append_log(
+                f"Preview rotation {saved}° restored from last session.",
+                ACCENT_CYAN)
+
     def _invalidate_liveview(self):
         """Something else closed LiveView; forget that we had one open."""
         with self._lv_lock:
@@ -1114,7 +1484,15 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
             self._append_log("Hardware layer not available "
                              "(pip install pyserial).", ACCENT_RED)
             return False
+        # Checked before the status test below, because with a worker up the
+        # status is always one of those four and the two paths would otherwise
+        # be unreachable in the wrong order.
+        if self._worker is not None:
+            return self._reconnect_tt_in_run()
         if self._status in ("running", "paused", "nocamera", "notable"):
+            # A backstop now rather than the gate it used to be: `_on_finished`
+            # puts the status back to idle when a worker ends, so reaching here
+            # means the status outlived its run.
             self._append_log("Cannot reconnect the turntable during a run.",
                              ACCENT_AMBER)
             return False
@@ -1157,6 +1535,76 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
             self._append_log(f"Turntable connection failed: {e}", ACCENT_RED)
             self._update_button_states()
             return False
+
+    def _reconnect_tt_in_run(self) -> bool:
+        """
+        Re-open the serial port while a paused run holds it.
+
+        `ComximClient.reconnect` is built for exactly this and says so: it
+        reopens IN PLACE, "keeping this object's identity so every reference
+        (the worker's and the window's) stays valid". So unlike the cold path
+        above, nothing here constructs a client — a fresh `ComximClient`
+        assigned to `self._tt` would leave `BridgeWorker.tt` pointing at the
+        closed one, and the run would rotate against a dead port for the rest
+        of the night.
+
+        It also re-does the CT+STARTUP / CT+ACK / CT+EVENT handshake
+        (`handshake=True` is the default) and returns True only once the
+        controller has actually answered it, so a True result means the table
+        is genuinely ready to turn rather than that a port opened.
+
+        THE PORT CANNOT CHANGE HERE. `reconnect` reuses the port and baud this
+        client was built with, and the COM field stays disabled for the length
+        of a run — deliberately, since re-pointing a run at a different device
+        mid-flight is not a reconnect. If Windows has re-enumerated the table on
+        another COM port, that needs Stop, the new port, and Recover; the log
+        says so on failure rather than leaving it to be guessed.
+        """
+        if not self._run_is_parked():
+            self._append_log(
+                "The run has not come to rest yet — wait for it to finish the "
+                "move it is on, then reconnect.", ACCENT_AMBER)
+            return False
+        if self._tt is None:                        # cannot happen with a run up
+            return False
+
+        self.pill_tt.set_state("reconnecting…", ACCENT_AMBER)
+        self._reconnecting = True
+        self._update_button_states()
+        QApplication.processEvents()
+        try:
+            # One retry, matching `_recover_turntable`: Windows is often still
+            # releasing the port on the first attempt after a replug.
+            ok = self._tt.reconnect(retries=1)
+        except Exception as e:                              # noqa: BLE001
+            ok = False
+            self._append_log(f"Turntable reconnect raised: {e}", ACCENT_RED)
+        try:
+            if ok:
+                # Re-muted because the beeper is exactly what a power cycle puts
+                # back, and a power cycle is the usual reason to press this.
+                # Best-effort inside `mute`, so an older firmware that has no
+                # SPKMUTE verb does not turn a good reconnect into a failure.
+                self._tt.mute(True)
+                self.pill_tt.set_state(
+                    f"{self._tt.port} @ {self._tt.baudrate}", ACCENT_GREEN)
+                self._append_log(
+                    f"Turntable link re-opened mid-run on {self._tt.port} — the "
+                    f"controller answered the handshake. Press Resume when "
+                    f"ready.", ACCENT_GREEN)
+            else:
+                self.pill_tt.set_state("failed", ACCENT_RED)
+                self._append_log(
+                    f"Could not re-open {self._tt.port}: the port did not open, "
+                    f"or opened and the controller stayed mute. Check the cable "
+                    f"and power. If Windows has moved the table to a different "
+                    f"COM port, that needs Stop, the new port, then Recover — a "
+                    f"mid-run reconnect can only reopen the one it started on.",
+                    ACCENT_RED)
+            return ok
+        finally:
+            self._reconnecting = False
+            self._update_button_states()
 
     # ══════════════════════════════════════════════════════════════════
     # Session control
@@ -1263,6 +1711,11 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
                                            _settled=True))
             return
 
+        # The `_spin_stop` above just proved whether the table answers at all.
+        # Do not start a run on a link that failed it.
+        if not self._table_link_ready():
+            return
+
         photos = self.spin_photos.value()
         self._positions_per_rev = self._rotation_geometry()[0]
         self._stacks_per_round = self._positions_per_rev + 1
@@ -1291,6 +1744,10 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         pct = int(100 * done_before / self._total_stacks) if self._total_stacks else 0
         self._set_total_text(f"{pct}%")
 
+        # A fresh run has not been asked to stop, whatever the last one did.
+        # Left set, the first Stop press on this run would escalate straight to
+        # cutting the port.
+        self._stop_requested = False
         self._elapsed = 0
         self._current_round = resume_from.round_idx if resume_from else 0
         self._current_stack = stack_at
@@ -1402,13 +1859,189 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         if self._worker:
             self._worker.toggle_pause()
 
+    def _table_link_ready(self) -> bool:
+        """
+        Don't start a run on a turntable link that has already failed.
+
+        WRITTEN FROM A REAL LOG, and the timings are the argument. A recovered
+        run went:
+
+            17:47:57  Could not stop the table: Write timeout
+            17:47:57  Resuming from revolution 3, position 1 …
+            17:48:22   Rotating 9.47°…          ← and never returned
+
+        The app had positive proof the port was dead twenty-five seconds before
+        it hung on it: `_spawn_worker` sends SETSTOP through `_spin_stop` on
+        every start, that write failed, and the failure was logged in amber and
+        otherwise ignored. Everything after it was certain to hang, because the
+        first thing a run does after a stack is rotate.
+
+        SETSTOP is a good probe precisely because it is already being sent. It
+        is a no-op on a stationary table, and `_command` waits for the
+        controller's CR+OK, so a clean return proves the link works in both
+        directions — not merely that a write was accepted.
+
+        One reconnect is attempted before giving up, since the common cause is a
+        port Windows has re-enumerated under the same name after a replug, which
+        reopening fixes outright. Refusing to start is the fallback, and it is a
+        far better outcome than the alternative: a run that shoots one stack and
+        then wedges, which is what actually happened.
+        """
+        err = self._tt_stop_error
+        if self._tt is None or not err:
+            return True
+
+        self._append_log(
+            f"The turntable did not accept the pre-run stop command ({err}). "
+            f"The link is already broken, and a run started now would hang on "
+            f"its first rotation — re-opening the port before going on…",
+            ACCENT_AMBER)
+        try:
+            ok = self._tt.reconnect(retries=1)
+        except Exception as e:                              # noqa: BLE001
+            ok = False
+            self._append_log(f"  Re-opening raised: {e}", ACCENT_RED)
+        if ok:
+            self._tt_stop_error = None
+            self._tt.mute(True)
+            self.pill_tt.set_state(
+                f"{self._tt.port} @ {self._tt.baudrate}", ACCENT_GREEN)
+            self._append_log(
+                f"Turntable port re-opened on {self._tt.port} and the "
+                f"controller answered — starting.", ACCENT_GREEN)
+            return True
+
+        self.pill_tt.set_state("failed", ACCENT_RED)
+        self._append_log(
+            "Could not re-open the turntable port, so the run has NOT been "
+            "started — nothing is lost and no frames were taken.", ACCENT_RED)
+        QMessageBox.warning(
+            self, "Turntable not responding",
+            f"The turntable on {self._tt.port} is not accepting commands, and "
+            f"re-opening the port did not fix it.\n\n"
+            f"A run started now would shoot its first stack and then hang on "
+            f"the first rotation, so it has not been started.\n\n"
+            f"Check the cable and that the table is powered on; if it is "
+            f"wedged, power-cycle it. Then press Reconnect under TABLE.")
+        self._update_button_states()
+        return False
+
+    #: How long a polite Stop is given before Stop starts cutting links.
+    #:
+    #: Stop sets a flag the run reads at its next gate, so a healthy run ends
+    #: within a fraction of a second — the flag is also checked every 0.2 s
+    #: inside `ComximClient.wait_for`, so even mid-rotation it is prompt. This
+    #: only has to outlast the ordinary case by enough that a normal Stop never
+    #: escalates. It does NOT have to cover a capture: a frame in progress can
+    #: legitimately take much longer than this, and the escalation deliberately
+    #: does not touch the camera (see `_force_stop_table`).
+    STOP_GRACE_MS = 4000
+
     def _stop_session(self):
-        if self._worker:
-            self._append_log("Stopping…", ACCENT_AMBER)
-            self._worker.request_stop()
+        """
+        Stop the run — and mean it.
+
+        THIS USED TO BE A REQUEST AND NOTHING MORE, which was fine until the
+        run stopped being able to hear it. `request_stop` sets a flag the worker
+        reads at its next gate; if the worker is blocked in a call that never
+        returns, the flag is never read and Stop does nothing at all. That
+        happened: with no write timeout on the serial port (see
+        `ComximClient.WRITE_TIMEOUT_S`) a rotation wedged inside `send()`, and
+        an overnight session ended with seven "Stopping…" lines in the log, a
+        dead Pause, a Reconnect button correctly greyed out because the run was
+        not parked, and no way out but killing the process.
+
+        So Stop now escalates. First press asks politely and starts a timer;
+        if the run is still alive when it fires — or if the user presses Stop
+        again, which is what anyone does — the links the run could be stuck on
+        are cut out from under it. `_force_stop_table` explains what is cut and
+        what deliberately is not.
+
+        The polite path is unchanged and is still what runs 99% of the time:
+        nothing is cut when a run stops the way it should.
+        """
+        if not self._worker:
+            return
+        if self._stop_requested:
+            # Second press. The user has already waited; do not make them wait
+            # out the timer as well.
+            self._force_stop_table(pressed_again=True)
+            return
+        self._stop_requested = True
+        self._append_log("Stopping…", ACCENT_AMBER)
+        self._worker.request_stop()
+        QTimer.singleShot(self.STOP_GRACE_MS, self._stop_watchdog)
+
+    def _stop_watchdog(self):
+        """Fired `STOP_GRACE_MS` after a Stop that has not taken effect."""
+        if self._worker is None or not self._stop_requested:
+            return                          # stopped cleanly; nothing to do
+        if not self._worker.isRunning():
+            return                          # thread is on its way out
+        self._force_stop_table(pressed_again=False)
+
+    def _force_stop_table(self, pressed_again: bool):
+        """
+        Break a wedged run out by closing the turntable's serial port.
+
+        WHY CLOSING THE PORT IS THE LEVER, rather than sending a stop command:
+        the thread that is stuck is stuck *inside* a write, holding
+        `ComximClient._tx_lock`. Any command this method tried to send would
+        queue up behind that lock and freeze the GUI thread too — turning one
+        wedged thread into a wedged application. `close()` takes no lock and
+        issues `CancelIoEx`, which pyserial's `write()` treats as a clean
+        return, so the stuck thread is released rather than merely joined by
+        a second victim. `ComximClient._teardown` carries the details.
+
+        WHAT HAPPENS NEXT, and why this ends the run rather than corrupting it:
+        the released `send()` returns, `rotate_single` moves on to `wait_for`,
+        and that checks its abort callback — `self._stop.is_set`, already true —
+        every 0.2 s, so it raises `InterruptedError` promptly. `BridgeWorker.run`
+        catches that as "Stopped by user", runs its `finally` (alarm off, live
+        view hold released, transfer mode restored) and emits finished. The run
+        ends through its ordinary Stop path, with the checkpoint from the last
+        stack intact, so **Recover** picks it up. That is the whole point: the
+        session survives.
+
+        THE CAMERA IS DELIBERATELY NOT CUT. Every camera call is already
+        time-bounded — 6 s per ordinary transfer, 90 s for the shutter, 180 s
+        for the commit — so a camera that goes quiet unwinds by itself, slowly
+        but surely. Closing its transport mid-transfer means calling into
+        libusb on a handle another thread is inside, which risks taking the
+        process down; and a killed process is exactly the outcome this method
+        exists to prevent. A wedged capture is a wait. A wedged write was
+        forever. Only the second one earns this.
+        """
+        if self._tt is None:
+            self._append_log(
+                "Stop is still waiting on the run, and there is no turntable "
+                "link left to cut. If it does not end, the last stack's "
+                "checkpoint is saved — Recover will pick it up.", ACCENT_AMBER)
+            return
+        self._append_log(
+            ("Stop pressed again — " if pressed_again else
+             f"Stop has not taken effect in {self.STOP_GRACE_MS / 1000:g}s — ")
+            + "cutting the turntable link to break the run out of whatever it "
+              "is waiting on.", ACCENT_RED)
+        try:
+            self._tt.close()
+        except Exception as e:                              # noqa: BLE001
+            self._append_log(f"  Closing the port raised: {e}", ACCENT_AMBER)
+        self.pill_tt.set_state("link cut", ACCENT_RED)
+        self._spin_dir, self._spin_level = None, 0
+        self._refresh_spin()
+        self._update_button_states()
+        self._append_log(
+            "Turntable port closed. The run should end within a second or two "
+            "and the last stack's checkpoint is saved. Press Reconnect under "
+            "TABLE to re-open the port, then RECOVER to carry on from where it "
+            "stopped.", ACCENT_AMBER)
 
     def _on_finished(self):
         self._worker = None
+        # Cleared here as well as at spawn, so a watchdog still in flight from
+        # the Stop that just worked finds nothing to escalate against.
+        self._stop_requested = False
         self.focus_panel.set_enabled(True)
         self._refresh_spin()
         self._refresh_zoom()
@@ -1553,6 +2186,23 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
         if self._status != self._pill_state_text:
             self._style_state_pill()
 
+        # THE RECONNECT BUTTONS LIGHT UP HERE, and this tick is the only thing
+        # that can do it. Pressing Pause tells the worker to stop, but it does
+        # not stop until its next gate — so "the run is now at rest" is a fact
+        # that becomes true on the worker thread with nothing emitted when it
+        # does. Rather than add a signal for it, the second-hand clock that is
+        # already running asks. The visible effect is worth having on its own:
+        # the buttons come alive a moment after Pause, which is exactly when the
+        # run really has come to rest.
+        #
+        # Edge-triggered, not level. `_update_button_states` rewrites button
+        # stylesheets, and doing that once a second for the length of a pause is
+        # the same waste the pill check above avoids. It owns `_parked_seen` —
+        # this only compares against it, so the flag can never drift from what
+        # the buttons are showing.
+        if self._run_is_parked() != self._parked_seen:
+            self._update_button_states()
+
     @staticmethod
     def _fmt_clock(total: int) -> str:
         m, s = divmod(int(max(total, 0)), 60)
@@ -1572,19 +2222,77 @@ class MainWindow(WindowLayoutMixin, QMainWindow):
     # ── button state ─────────────────────────────────────────────────
     def _update_button_states(self):
         active = self._status in ("running", "paused", "nocamera", "notable")
-        self.btn_start.setEnabled(not active and HARDWARE_AVAILABLE)
+        # A single shot or a mid-run reconnect holds the camera for a second or
+        # two. Everything that would take the same link is held off for that
+        # long — Start and Recover because a worker opening mid-capture would
+        # interleave two multi-transaction sequences, and each of those two
+        # actions against the other because they CLOSE the transport the other
+        # is still reading through.
+        busy = self._link_busy()
+        self.btn_start.setEnabled(not active and not busy and HARDWARE_AVAILABLE)
         # Pause only applies while the run is actually turning; while it is
         # blocked waiting for a dropped device, Stop is the only lever.
-        self.btn_pause.setEnabled(self._status in ("running", "paused"))
+        #
+        # AND NOT DURING A RECONNECT, for the length of one. Resume there would
+        # unpark the worker while `close()` is still tearing the transport down:
+        # `close()` nulls the client's handle before the old one has finished
+        # closing, so the worker's next command would find None, build a fresh
+        # transport, and have the interface pulled out from under it as the old
+        # close completes. `PTPCameraClient._open_lock` does not cover that —
+        # it serialises opens against opens, and its own docstring calls the
+        # orphaned-handle result "unrecoverable without a device reset".
         self.btn_stop.setEnabled(active)
-        self.btn_connect_tt.setEnabled(not active)
-        self.btn_connect_camera.setEnabled(not active)
+        self.btn_pause.setEnabled(self._status in ("running", "paused")
+                                  and not busy)
+        # Stop stays live throughout, deliberately: it is the emergency lever
+        # and it only sets a flag the worker reads at its next gate.
+
+        # BOTH RECONNECTS STAY LIVE THROUGH A PAUSE, which is the one place
+        # `active` is not the whole answer. A paused run that has actually come
+        # to rest holds both links open and idle, and re-opening one there is
+        # the difference between fixing a knocked cable in place and throwing
+        # away the revolution. `_run_is_parked` is what makes "at rest" a fact
+        # rather than a label — a run is flagged paused the instant the button
+        # is pressed, seconds before it reaches a point where it is safe. The
+        # two `_reconnect_*_in_run` methods do the work, in place on the client
+        # objects the worker already holds.
+        parked = self._run_is_parked()
+        # RECORDED HERE, not in the tick that reads it, and the difference is a
+        # bug that was in this code for one revision. The tick only decides
+        # whether to CALL this method; the value the buttons actually reflect is
+        # decided here. Tracking it in the tick instead let the two disagree:
+        # pause (buttons off, tick records parked) → resume → pause again left
+        # the flag reading True while this method had recomputed the buttons off,
+        # so when the run parked the tick saw no change and never lit them. The
+        # invariant is simply "this flag is the parked value the buttons show".
+        self._parked_seen = parked
+        self.btn_connect_tt.setEnabled((not active or parked) and not busy)
+        self.btn_connect_camera.setEnabled((not active or parked) and not busy)
+        # The port and baud fields do NOT come back with them. A reconnect
+        # re-opens the device the run started on; pointing a run at a different
+        # one halfway through is not the same act, and `ComximClient.reconnect`
+        # reuses its own stored port regardless of what the field says — so
+        # leaving these editable would only invite a change that silently did
+        # nothing.
         for w in (self.field_com, self.field_baud):
             w.setEnabled(not active)
 
+        # One frame, no rotation, into <subject>_singleshots — see
+        # `_single_shot`. Needs a camera and an idle link; the guards at the top
+        # of that method are the real gate, this is what makes the state visible
+        # rather than leaving a live-looking button that does nothing.
+        #
+        # NOT extended to a parked run, unlike the two reconnects above. A
+        # reconnect puts back something that is broken; a single shot costs an
+        # actuation and lands a frame in a folder, and a paused run is a run
+        # that is going to carry on — so a test exposure taken in the middle of
+        # one would leave a frame nobody can place afterwards.
+        self.btn_single_shot.setEnabled(
+            not active and not busy and self._camera is not None)
+
         # Recover appears only when a run is not active AND there's a
         # checkpoint to pick up from (i.e. a run was interrupted).
-        can_recover = (not active and HARDWARE_AVAILABLE
+        can_recover = (not active and not busy and HARDWARE_AVAILABLE
                        and self._last_checkpoint is not None)
         self.btn_resume_run.setVisible(can_recover)
         self.btn_resume_run.setEnabled(can_recover)

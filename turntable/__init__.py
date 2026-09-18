@@ -13,4 +13,4 @@ Layout
 Run it with ``python turntable_app.py`` from the project root.
 """
 
-__version__ = "1.0"
+__version__ = "2.0"

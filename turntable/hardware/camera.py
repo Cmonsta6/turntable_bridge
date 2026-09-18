@@ -39,8 +39,17 @@ from .constants import CAMERA_UNKNOWN, SESSION_COUNTER_START
 from .errors import CameraError
 from . import ptp
 
-#: `[Counter 4 digit]`. The resume and audit code both key off the names this
-#: produces, so the token spelling is load-bearing.
+#: `[Counter 4 digit]`. The token spelling is load-bearing in one direction
+#: only: `set_filename_template` callers write it and this substitutes it, so a
+#: template that misspells it silently produces the literal text in every
+#: filename. It is NOT parsed back anywhere. This note used to claim "the resume
+#: and audit code both key off the names this produces", which would make the
+#: whole naming scheme unchangeable — and it is not true. Resume works from
+#: `RunCheckpoint`, which carries the revolution and position as NUMBERS;
+#: `count_images_in` counts by extension; and `stacking._renumber` swaps names
+#: between files without reading them. Nothing in the app reads a counter, a
+#: revolution or a position back out of a filename, which is what made the
+#: naming free to change.
 _COUNTER_TOKEN = re.compile(r"\[Counter\s+(\d+)\s+digit\]", re.IGNORECASE)
 
 
@@ -249,6 +258,44 @@ class PTPCameraClient:
             return str(path) if path else "OK"
         except ptp.PTPError as e:
             raise CameraError(f"Capture failed: {e}") from e
+
+    def capture_to(self, folder: Path, filename: str) -> str:
+        """
+        Fire ONE frame straight into `folder` under `filename`, and return the
+        path written. For the single-shot button, not for a run.
+
+        TOUCHES NO SESSION STATE, deliberately. `capture()` renders its name
+        from `_folder`/`_template`/`_counter`, so reaching the same effect
+        through it would mean `begin_stack` + `set_filename_template` — which
+        re-points where captures land and resets the frame counter. A run
+        re-establishes both per stack (`worker.run` calls `begin_stack` for
+        every position), so that would probably survive; "probably" is not
+        worth it for a convenience button, and a single shot taken between two
+        Recover presses would be repointing state a resumed run is mid-way
+        through using. Nothing here writes to any field.
+
+        ALWAYS PULLS TO THE PC, ignoring `set_transfer_mode`. The button's
+        whole contract is a file in the user's output folder, and card-only
+        mode would leave nothing there — so the mode is bypassed rather than
+        obeyed, and the caller says so in the log. That costs no lingering
+        state: `ptp.set_recording_media` is written per capture and put back
+        both ways, so the next run's first frame sets it to whatever that run
+        asked for.
+
+        The name is a stem; `ptp.shoot` adds the body's own extension and, if
+        something of that name is already there, a numeric suffix — so the
+        returned path is the one actually written, which is not necessarily
+        the one requested.
+        """
+        cam = self._ensure()
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            path = cam.shoot(dest_dir=folder, filename=filename,
+                             timeout_s=self._timeout_s)
+        except ptp.PTPError as e:
+            raise CameraError(f"Capture failed: {e}") from e
+        return str(path) if path else "OK"
 
     # ── live view ────────────────────────────────────────────────────────
     def show_liveview(self) -> str:

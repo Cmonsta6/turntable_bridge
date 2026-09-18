@@ -938,6 +938,21 @@ class FocusPanel(QWidget):
                     f"Move {units} driver units towards {way}.\n"
                     f"Opens live view first if it isn't running.")
 
+        # ONE MINIMUM FOR ALL EIGHT: the widest label's preferred width. The
+        # row hands the arrows equal stretch, so at the row's own preferred
+        # width they all come out the SAME size — the average of their hints
+        # — and the two widest ("◄ 500", "500 ►") lose the 4 px their text
+        # needs and render as "◄ 50". Only visible when the live-view card is
+        # at its floor, which the column layout actually reaches (a portrait
+        # frame on a 1080p screen). Setting every arrow's minimum to the
+        # widest hint makes the equal share never smaller than the widest
+        # label, and re-running it on every relabel keeps it true whatever
+        # the sizes come out as.
+        arrows = [b for pair in sizes for b in pair[:2]]
+        widest = max(b.sizeHint().width() for b in arrows)
+        for b in arrows:
+            b.setMinimumWidth(widest)
+
     # ── display ──────────────────────────────────────────────────────
     # There is no numeric readout. The track draws position, A, B, the range
     # between them and both mechanical stops, all to scale — a row of
@@ -969,6 +984,21 @@ class FocusPanel(QWidget):
 
     def _update_button_states(self):
         self._set_controls_enabled(not self._busy)
+
+    @property
+    def busy(self) -> bool:
+        """
+        Is a focus command in flight on this panel's worker thread?
+
+        Exists for the single-shot button in the live-view header, which is the
+        first control outside this panel that can drive the camera while a jog
+        is running. Greying the panel's own buttons is not enough there: the
+        two are separate widgets and a shutter release landing between a
+        MfDrive and the `wait_ready` that confirms it would interleave two
+        multi-transaction sequences on one USB link. The transport's lock makes
+        that safe transaction by transaction, not sequence by sequence.
+        """
+        return self._busy
 
     # ── getters used by the run ───────────────────────────────────────
     def get_range(self) -> Optional[int]:

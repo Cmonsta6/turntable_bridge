@@ -16,10 +16,41 @@ from typing import Callable, List, Optional
 import serial
 
 from .constants import EVENT_DONE_TOKEN, MSG_ERR, MSG_OK
-from .errors import RotateDoneTimeout, TurntableError, TurntablePortClosed
+from .errors import (
+    RotateDoneTimeout, TurntableError, TurntablePortClosed,
+    TurntableWriteTimeout,
+)
 
 
 class ComximClient:
+    #: Seconds a single write may take before it is called a failure. PASSED TO
+    #: `serial.Serial`, AND IT MUST BE — omitting it is not "use the default",
+    #: it is "wait forever", and that cost a whole overnight session.
+    #:
+    #: Measured against pyserial 3.5's `serialwin32`. With `write_timeout=None`
+    #: it leaves `COMMTIMEOUTS.WriteTotalTimeoutConstant` and `Multiplier` at 0,
+    #: which is the Windows encoding for NO write timeout, and `write()` then
+    #: calls `GetOverlappedResult(..., bWait=True)`. On a port whose write never
+    #: completes — the table unplugged, powered off, or its driver wedged — that
+    #: call never returns. The worker thread stopped inside `send()` still
+    #: holding `_tx_lock`, so Stop could not reach it (Stop only sets a flag the
+    #: run reads at its next gate), Pause could not, and every other thread that
+    #: touched the table queued up behind the lock. The window was left with a
+    #: run it could not end and a session that could only be killed.
+    #:
+    #: 2 s is enormous for the traffic involved: the longest command here is
+    #: about 30 bytes, which is roughly 2.6 ms at 115200 baud. Anything past
+    #: that is not a slow write, it is a broken one. Generous anyway, because a
+    #: false positive costs a needless reconnect.
+    #:
+    #: This is the fix for the HANG. It is not the whole fix for the incident —
+    #: a timeout still leaves up to 2 s per attempt and a retry ladder above it,
+    #: so `MainWindow._force_stop_table` closes the port outright when the user
+    #: has asked twice. Both are needed: this one keeps a broken port from
+    #: freezing a run at all, that one gets the user out of a freeze that
+    #: happens anyway.
+    WRITE_TIMEOUT_S = 2.0
+
     def __init__(self, port: str, baudrate: int = 115200,
                  read_timeout: float = 0.1):
         self.port = port
@@ -33,7 +64,8 @@ class ComximClient:
         self._thread: Optional[threading.Thread] = None
         try:
             self.ser = serial.Serial(port=port, baudrate=baudrate,
-                                     timeout=read_timeout)
+                                     timeout=read_timeout,
+                                     write_timeout=self.WRITE_TIMEOUT_S)
         except serial.SerialException as e:
             raise TurntableError(
                 f"Cannot open {port} at {baudrate} baud: {e}"
@@ -48,8 +80,23 @@ class ComximClient:
         return not self._closed and bool(getattr(self.ser, "is_open", False))
 
     def _teardown(self):
-        """Stop the reader thread and close the port, leaving the object
-        marked closed. Idempotent — safe to call before a reconnect."""
+        """
+        Stop the reader thread and close the port, leaving the object marked
+        closed. Idempotent — safe to call before a reconnect.
+
+        SAFE TO CALL FROM ANOTHER THREAD WHILE A WRITE IS IN PROGRESS, and that
+        is load-bearing rather than incidental: it is how the window breaks a
+        run out of a wedged write (`MainWindow._force_stop_table`). Two reasons
+        it works. It takes no `_tx_lock`, so it cannot deadlock against the
+        thread stuck inside `send()`. And `serial.Serial.close()` issues
+        `CancelIoEx` on the pending write, which pyserial's `write()` handles
+        explicitly — `if GetLastError() == ERROR_OPERATION_ABORTED: return` — so
+        the blocked writer returns cleanly instead of being left in the OS.
+
+        Bounded, too, which matters when the caller is the GUI thread: the
+        reader's own read timeout is `read_timeout` (0.1 s), so the join below
+        returns almost at once and never waits out its full 2 s.
+        """
         self._closed = True
         self._stop.set()
         t = self._thread
@@ -82,8 +129,13 @@ class ComximClient:
         self._teardown()
         for i in range(max(retries, 0) + 1):
             try:
+                # write_timeout here too, and for the same reason — a reconnect
+                # that dropped it would hand the run back a port that can hang
+                # forever, which is the failure this whole ladder exists to
+                # recover from. See WRITE_TIMEOUT_S.
                 ser = serial.Serial(port=self.port, baudrate=self.baudrate,
-                                    timeout=self.read_timeout)
+                                    timeout=self.read_timeout,
+                                    write_timeout=self.WRITE_TIMEOUT_S)
             except Exception:
                 if i < retries:
                     time.sleep(backoff_s)
@@ -141,12 +193,35 @@ class ComximClient:
 
     # -- io ---------------------------------------------------------------
     def send(self, cmd: str):
+        """
+        Write one command. Bounded by `WRITE_TIMEOUT_S` — never open-ended.
+
+        Both failure shapes come out as `TurntablePortClosed` or its
+        `TurntableWriteTimeout` subclass, which is what routes them into the
+        reconnect ladder rather than ending the run: `_rotate_with_recovery`
+        treats a plain `TurntableError` from an open port as a controller
+        refusal and re-raises it, and a wedged port is not that.
+
+        pyserial's own exception is converted rather than allowed out, so
+        callers never have to import pyserial to catch it — see errors.py.
+        """
         if self._closed:
             raise TurntablePortClosed("Turntable port is closed.")
         if not cmd.endswith(";"):
             cmd += ";"
-        with self._tx_lock:
-            self.ser.write(cmd.encode("ascii", errors="ignore"))
+        try:
+            with self._tx_lock:
+                self.ser.write(cmd.encode("ascii", errors="ignore"))
+        except serial.SerialTimeoutException as e:
+            raise TurntableWriteTimeout(
+                f"the turntable port accepted no data within "
+                f"{self.WRITE_TIMEOUT_S:g}s ({e})") from e
+        except serial.SerialException as e:
+            # Covers the port being yanked mid-write, which pyserial reports as
+            # a plain SerialException from WriteFile. Same treatment: the port
+            # is unusable and wants reopening, not a run aborted.
+            raise TurntablePortClosed(
+                f"the turntable port failed mid-write ({e})") from e
 
     def drain_rx(self):
         while True:

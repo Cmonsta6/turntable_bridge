@@ -22,6 +22,32 @@ class TurntablePortClosed(TurntableError):
     pass
 
 
+class TurntableWriteTimeout(TurntablePortClosed):
+    """
+    A write to the serial port did not complete in time — the port is open but
+    the OS will not take the bytes.
+
+    A SUBCLASS OF TurntablePortClosed ON PURPOSE, because an open-but-wedged
+    port needs the same handling as a closed one and precisely NOT the handling
+    a controller error gets: `recovery._rotate_with_recovery` re-raises a plain
+    `TurntableError` from an open port as unrecoverable, and this must go down
+    the reconnect ladder instead. Inheriting routes it correctly everywhere
+    without a single `except` clause changing.
+
+    It exists as a type at all because the alternative is letting pyserial's
+    `SerialTimeoutException` escape into callers, and this module is
+    deliberately dependency-free so that every `except` clause in the app can
+    import it unconditionally.
+
+    THE FAILURE IT REPLACES was a hang, not an error. `ComximClient` used to
+    open the port with no write timeout, which on Windows means no OS write
+    timeout at all, and pyserial then waits on the overlapped result forever.
+    A run that hit it froze inside `send()` holding the transmit lock, with
+    Stop unable to reach it — see `ComximClient.WRITE_TIMEOUT_S`.
+    """
+    pass
+
+
 class RotateDoneTimeout(TurntableError):
     """The turntable acknowledged the rotate (we saw OK) but its terminal
     'done' event never arrived. The move has almost certainly completed and
