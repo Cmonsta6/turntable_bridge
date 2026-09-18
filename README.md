@@ -95,6 +95,9 @@ app will no longer be able to open it until you redo the Zadig step.
 
 ## Install and run
 
+Go to the releases page to find the .exe
+https://github.com/Cmonsta6/turntable_bridge/releases
+
 ```bash
 pip install -r requirements.txt
 ```
