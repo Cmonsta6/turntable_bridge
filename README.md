@@ -202,8 +202,7 @@ several frames on the same plane. If you see it on every stack, A or B is set
 past the end of the lens.
 
 **It recovers from drop-outs.** If the camera is unplugged or the table stops
-answering, the run pauses, sounds an alarm and waits for the device to come back
-rather than dying at 3am. A checkpoint is written at every stack, so an
+answering, the run pauses, sounds an alarm and waits for the device to come back online. A checkpoint is written at every stack, so an
 interrupted run can be resumed with **Recover**.
 
 **STOP escalates if the run does not hear it.** Stop normally just asks the run
